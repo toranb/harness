@@ -227,6 +227,12 @@ defmodule Go do
     }
   ]
 
+  # The most output tokens one reply may use. This limits a single reply, not
+  # the conversation (the context window is far larger). 128,000 is the
+  # maximum Haiku 5.5, Sonnet 5.5 and Opus 5.5 accept; anything higher is a
+  # 400. You pay for the tokens a reply actually uses, not for this limit.
+  @max_tokens 128_000
+
   # Every tool result is cut to this many characters, so one big file or web
   # page can't flood the context window. truncate/1 adds a note when it cuts.
   @max_output 50_000
@@ -328,7 +334,7 @@ defmodule Go do
   def request_body(messages, cwd) do
     %{
       model: System.get_env("API_MODEL", "claude-haiku-5-5"),
-      max_tokens: 16_000,
+      max_tokens: @max_tokens,
       cache_control: %{type: "ephemeral"},
       system: [
         %{type: "text", text: system_prompt(cwd), cache_control: %{type: "ephemeral"}}

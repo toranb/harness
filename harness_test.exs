@@ -117,6 +117,10 @@ defmodule GoTest do
       assert text == Go.system_prompt("/some/project")
     end
 
+    test "asks for the largest reply the current models accept" do
+      assert Go.request_body([%{role: "user", content: "hi"}], "/p").max_tokens == 128_000
+    end
+
     test "the cached prefix is byte-identical across requests" do
       first = Go.request_body([%{role: "user", content: "a"}], "/p")
       later = Go.request_body([%{role: "user", content: "b"}], "/p")

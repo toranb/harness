@@ -189,7 +189,7 @@ model wrote to judge whether the task is done. It only reads the
 |---|---|---|
 | `tool_use` | The model asked for one or more tools and is waiting for the results | Run them, send the results, call the model again |
 | `end_turn` | The model finished its answer | Wait for your next message at `>` |
-| `max_tokens` | The reply hit the 16,000-token output limit | Treat it as the end of the turn (see [Limitations](#limitations)) |
+| `max_tokens` | The reply hit the 128,000-token output limit | Treat it as the end of the turn (see [Limitations](#limitations)) |
 | anything else (e.g. `refusal`) | The model stopped for another reason | Treat it as the end of the turn |
 
 The whole decision is one line in `loop/2`:
@@ -508,10 +508,12 @@ status if any test fails, so it works in CI or a git hook.
 - **Compaction is manual.** If you never type `/compact`, a very long
   session will eventually hit the model's context limit. A compacted session
   only remembers what the summary kept.
-- **`max_tokens` during a tool call.** If a reply is cut off at 16,000 output
-  tokens partway through a tool call, the harness treats it as the end of the
+- **`max_tokens` during a tool call.** Each reply may use up to 128,000
+  output tokens, the most these models accept. If a reply is cut off at that
+  limit partway through a tool call, the harness treats it as the end of the
   turn, and the next request is likely to fail. The status line shows
-  `stop_reason=max_tokens` when this happens.
+  `stop_reason=max_tokens` when this happens. The limit is per reply; the
+  conversation as a whole can be far larger.
 - **Tool calls aren't shown while they stream.** Only text is printed as it
   arrives; a tool call appears once its input is complete.
 - **Tools run one at a time,** even when the model asks for several at once.
