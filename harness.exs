@@ -69,8 +69,8 @@ defmodule Go do
     %{
       name: "WebFetch",
       description:
-        "Fetch a URL over HTTP(S) with a GET request and return the response body " <>
-          "(truncated to 50,000 characters).",
+        "Fetch a URL over HTTP(S) with a GET request and return the status and response " <>
+          "body (truncated to 50,000 characters). A 4xx or 5xx status is reported as an error.",
       input_schema: %{
         type: "object",
         properties: %{url: %{type: "string", description: "Fully qualified http(s) URL to fetch"}},
@@ -915,16 +915,18 @@ defmodule Go do
     {"Edited #{path}", false}
   end
 
+  # A 4xx or 5xx is an error result, so the model sees that the fetch failed
+  # and can try another URL instead of reading an error page as the answer.
+  # No retries: the model decides whether a failed fetch is worth repeating.
   def execute_tool("WebFetch", %{"url" => url}) do
-    r = Req.get!(url, decode_body: false, receive_timeout: 30_000)
-    {"HTTP #{r.status}\n\n" <> truncate(to_string(r.body)), false}
+    r = Req.get!(url, decode_body: false, receive_timeout: 30_000, retry: false)
+    {"HTTP #{r.status}\n\n" <> truncate(to_string(r.body)), r.status >= 400}
   end
 
   def execute_tool("Bash", %{"command" => command} = input) do
     timeout = (input["timeout"] || @bash_timeout) |> max(1) |> min(@bash_max_timeout)
     {out, status} = run_bash(command, timeout)
-    # Binary output would make the request invalid JSON, so bad bytes become �.
-    output = out |> String.replace_invalid() |> String.trim_trailing() |> truncate()
+    output = out |> truncate() |> String.trim_trailing()
 
     case status do
       :timeout -> {output <> "\n\n(killed after #{timeout} seconds)", true}
@@ -974,7 +976,7 @@ defmodule Go do
 
     receive do
       {^port, {:data, data}} ->
-        acc = if byte_size(acc) < @bash_max_bytes, do: acc <> data, else: acc
+        acc = acc <> data
 
         case split_marker(acc, marker) do
           # bash has exited. Close our end of the pipe instead of waiting for
@@ -984,7 +986,7 @@ defmodule Go do
             {output, code}
 
           nil ->
-            collect_output(port, deadline, marker, acc)
+            collect_output(port, deadline, marker, cap_output(acc))
         end
 
       # bash exited without printing the marker (its own EXIT trap replaced ours).
@@ -995,6 +997,19 @@ defmodule Go do
         kill_port(port)
         {acc, :timeout}
     end
+  end
+
+  # Keeps the output under @bash_max_bytes while a command runs. Past the cap
+  # it keeps the first bytes (the part the model will see) and the newest
+  # 100, which is enough to still catch the marker line when it arrives,
+  # even if it is split across two chunks.
+  @marker_room 100
+
+  defp cap_output(acc) when byte_size(acc) <= @bash_max_bytes, do: acc
+
+  defp cap_output(acc) do
+    head = binary_part(acc, 0, @bash_max_bytes - @marker_room)
+    head <> binary_part(acc, byte_size(acc) - @marker_room, @marker_room)
   end
 
   # {output before the marker, exit code} once the marker line has arrived.
@@ -1045,10 +1060,14 @@ defmodule Go do
   end
 
   @doc """
-  Cuts text to `@max_output` characters, with a note saying so, so the model
-  knows it is not seeing everything.
+  Prepares a tool's output for the model: bytes that aren't valid UTF-8
+  (a binary file, a PNG from WebFetch, `head /dev/urandom`) become �, since
+  the result goes back to the API as JSON and is printed to the terminal.
+  Then cuts it to `@max_output` characters, with a note saying so, so the
+  model knows it is not seeing everything.
   """
   def truncate(text) do
+    text = String.replace_invalid(text)
     length = String.length(text)
 
     if length <= @max_output do

@@ -83,6 +83,22 @@ defmodule GoTest do
       end)
     end
 
+    test "returns at once with more output than it keeps, while a background job runs" do
+      started = System.monotonic_time(:millisecond)
+
+      # 2 MB is past @bash_max_bytes, and the background job holds the pipe
+      # open, so only the marker can tell the tool the command is done.
+      {output, true} =
+        Go.execute_tool("Bash", %{
+          "command" => "sleep 5 & yes | head -c 2000000; exit 3",
+          "timeout" => 10
+        })
+
+      assert System.monotonic_time(:millisecond) - started < 3_000
+      assert output =~ "(truncated: showing the first 50000 of"
+      assert String.ends_with?(output, "(exit 3)")
+    end
+
     test "reports the exit code from exit, and from a script whose own EXIT trap replaces ours" do
       assert {"bye\n\n(exit 4)", true} =
                Go.execute_tool("Bash", %{"command" => "echo bye; exit 4"})
@@ -110,6 +126,53 @@ defmodule GoTest do
         assert output =~ "(exit 1)"
       end)
     end
+  end
+
+  describe "WebFetch tool" do
+    test "a 2xx is a result with the status and body" do
+      assert {"HTTP 200\n\nhello", false} =
+               Go.execute_tool("WebFetch", %{"url" => serve_once(200, "hello")})
+    end
+
+    test "a 404 or 500 is an error, so the model can try something else" do
+      assert {"HTTP 404\n\nnot here", true} =
+               Go.execute_tool("WebFetch", %{"url" => serve_once(404, "not here")})
+
+      # No retries: a 500 comes back at once instead of after Req's backoff.
+      started = System.monotonic_time(:millisecond)
+
+      assert {"HTTP 500\n\nboom", true} =
+               Go.execute_tool("WebFetch", %{"url" => serve_once(500, "boom")})
+
+      assert System.monotonic_time(:millisecond) - started < 1_000
+    end
+
+    test "a binary body comes back as valid UTF-8" do
+      {output, false} = Go.execute_tool("WebFetch", %{"url" => serve_once(200, <<0xFF, "x">>)})
+      assert output == "HTTP 200\n\n�x"
+    end
+  end
+
+  # A local HTTP server that answers one request with `status` and `body`,
+  # so WebFetch can be tested without the network. Returns its URL.
+  defp serve_once(status, body) do
+    {:ok, listen} = :gen_tcp.listen(0, [:binary, active: false, reuseaddr: true])
+    {:ok, port} = :inet.port(listen)
+
+    spawn_link(fn ->
+      {:ok, socket} = :gen_tcp.accept(listen)
+      {:ok, _request} = :gen_tcp.recv(socket, 0)
+
+      :gen_tcp.send(
+        socket,
+        "HTTP/1.1 #{status} Status\r\ncontent-length: #{byte_size(body)}\r\n" <>
+          "connection: close\r\n\r\n" <> body
+      )
+
+      :gen_tcp.close(socket)
+    end)
+
+    "http://127.0.0.1:#{port}/"
   end
 
   describe "instruction context" do
@@ -209,6 +272,21 @@ defmodule GoTest do
 
       assert output =~ "(truncated: showing the first 50000 of 60000 characters"
       assert String.length(output) < 50_200
+    end
+
+    @tag :tmp_dir
+    test "Read of a binary file returns valid UTF-8, so the session doesn't crash",
+         %{tmp_dir: dir} do
+      path = Path.join(dir, "blob.bin")
+      File.write!(path, <<0x89, "PNG", 0xFF, 0xFE, "ok">>)
+
+      {output, false} = Go.execute_tool("Read", %{"file_path" => path})
+
+      assert output == "�PNG��ok"
+      # Printing the summary and encoding the request (Req uses Jason) both
+      # raised on the raw bytes and ended the session.
+      assert Go.result_summary(output, false) =~ "ok, 8 chars"
+      assert {:ok, _} = Jason.encode(Go.request_body([%{role: "user", content: output}], "/"))
     end
 
     test "a blank prompt asks at > and blank lines are skipped" do

@@ -317,7 +317,7 @@ Run with `--debug` to see the full request for every turn.
 | **Read** | Returns a file's contents | Cut at 50,000 characters |
 | **Write** | Creates or overwrites a file, creating folders as needed | |
 | **Edit** | Replaces one exact occurrence of `old_string` with `new_string` | `old_string` must not be empty and must appear exactly once |
-| **WebFetch** | Plain HTTP GET of a URL | 30-second timeout, body cut at 50,000 characters |
+| **WebFetch** | Plain HTTP GET of a URL; returns the status and the body | 30-second timeout, no retries, body cut at 50,000 characters. A 4xx or 5xx is an error, so the model knows the fetch failed and can try another URL |
 | **Bash** | Runs any command with `bash -c` in the working directory and returns stdout and stderr together, then the exit code | Killed after `timeout` seconds (default 120, max 600). Output cut at 50,000 characters |
 
 Read, Write and Edit stay as separate tools even though Bash could do the
@@ -363,8 +363,14 @@ to:
   (`@bash_unset_env`), so a command can't read the key the harness itself
   uses and send it somewhere.
 - **Bounded output.** At most 1 MB of output is kept while the command runs,
-  so `yes` can't fill memory before the deadline. Bytes that aren't valid
-  UTF-8 become `�`, because the result goes back to the API as JSON.
+  so `yes` can't fill memory before the deadline. Past the cap,
+  `cap_output/1` keeps the first bytes plus the newest 100, so the marker
+  is still seen and the command still returns at once.
+
+Every tool's output goes through `truncate/1`, which turns bytes that
+aren't valid UTF-8 into `�` before cutting the text to 50,000 characters.
+The result goes back to the API as JSON and is printed in the terminal, and
+raw binary (a Read of an image, a PNG from WebFetch) would break both.
 
 Each call is a fresh shell: `cd` and `export` don't carry over to the next
 call, so the model chains them (`cd lib && ls`). A non-zero exit code is
@@ -644,9 +650,13 @@ call), the status line, and the streaming parser.
 The Bash tests run real commands. They check pipes and exit codes, stderr,
 the working directory, empty stdin, the timeout kill, invalid UTF-8, that
 `git commit` fails instead of waiting for an editor, that a command returns
-at once while a background job keeps running, that `exit` codes come through
+at once while a background job keeps running (also past the 1 MB output
+cap), that `exit` codes come through
 (also when a script sets its own `EXIT` trap), and that the API key is not in
-a command's environment. The streaming
+a command's environment. The WebFetch tests start a one-request local
+server, so they don't need the network: a 404 and a 500 are errors and a
+binary body comes back as valid UTF-8. A Read test does the same for a
+binary file. The streaming
 tests feed in a sample event stream, both whole and split into chunks as
 small as one byte, and check that every split gives the same reply.
 
@@ -661,9 +671,12 @@ test fails, so it works in CI or a git hook.
 - **`max_tokens` during a tool call.** Each reply may use up to 128,000
   output tokens, the most these models accept. If a reply is cut off at that
   limit partway through a tool call, the harness treats it as the end of the
-  turn, and the next request is likely to fail. The status line shows
-  `stop_reason=max_tokens` when this happens. The limit is per reply; the
-  conversation as a whole can be far larger.
+  turn, and the next request fails because that call has no result. The
+  status line shows `stop_reason=max_tokens`, the retry prompt appears, and
+  you type `exit`. This is left unhandled on purpose: it takes a single
+  reply of about 400 KB of text, while everyday replies are a few hundred
+  to a couple of thousand tokens. The limit is per reply; the conversation
+  as a whole can be far larger.
 - **Bash forgets between calls.** `cd` and `export` last for one command
   only.
 - **A timeout kills the shell and its direct children.** A grandchild
