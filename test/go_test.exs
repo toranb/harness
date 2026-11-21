@@ -2,7 +2,7 @@ defmodule GoTest do
   use ExUnit.Case
   doctest Go
 
-  test "greets the world" do
-    assert Go.hello() == :world
+  test "adds two numbers" do
+    assert Go.run(1, 2) == 3
   end
 end

@@ -1,18 +1,20 @@
 defmodule Go do
   @moduledoc """
-  Documentation for `Go`.
+  Tiny hello world module.
   """
 
   @doc """
-  Hello world.
+  Adds two numbers, prints the result, and returns it.
 
   ## Examples
 
-      iex> Go.hello()
-      :world
+      iex> Go.run(1, 2)
+      3
 
   """
-  def hello do
-    :world
+  def run(a, b) do
+    x = a + b
+    IO.inspect(x)
+    x
   end
 end
