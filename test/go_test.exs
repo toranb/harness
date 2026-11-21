@@ -100,4 +100,18 @@ defmodule GoTest do
       assert String.ends_with?(message, "</project_instructions>\n\nfix the bug")
     end
   end
+
+  describe "single-file harness.exs" do
+    test "embeds lib/go.ex and go.exs verbatim" do
+      script = File.read!("harness.exs")
+
+      assert script =~ "Mix.install([{:req,"
+
+      assert String.contains?(script, File.read!("lib/go.ex")),
+             "harness.exs is out of date with lib/go.ex; regenerate it"
+
+      assert String.contains?(script, File.read!("go.exs")),
+             "harness.exs is out of date with go.exs; regenerate it"
+    end
+  end
 end
