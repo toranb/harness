@@ -216,6 +216,28 @@ defmodule Go do
     end
   end
 
+  @doc false
+  # Prompt caching. The API renders tools -> system -> messages, and a cache
+  # entry covers everything up to a breakpoint. Two breakpoints:
+  #   1. explicit, on the system prompt: caches tools + system, which are
+  #      identical for every request (and every session in the same folder);
+  #   2. automatic (top-level cache_control): the API puts it on the last
+  #      block and moves it forward as the conversation grows, so each loop
+  #      iteration reads the previous request's prefix from cache.
+  # Anything that changes those bytes (tool list, system text, model) misses.
+  def request_body(messages, cwd) do
+    %{
+      model: System.get_env("API_MODEL", "claude-haiku-5-5"),
+      max_tokens: 16_000,
+      cache_control: %{type: "ephemeral"},
+      system: [
+        %{type: "text", text: system_prompt(cwd), cache_control: %{type: "ephemeral"}}
+      ],
+      tools: @tools,
+      messages: messages
+    }
+  end
+
   @doc """
   Interactive agent session. Starts from a prompt, runs tools until the
   model finishes its turn, then waits at a `>` prompt for the next message.
@@ -228,13 +250,7 @@ defmodule Go do
   def run(messages) when is_list(messages) do
     {:ok, _} = Application.ensure_all_started(:req)
 
-    body = %{
-      model: System.get_env("API_MODEL", "claude-haiku-5-5"),
-      max_tokens: 16_000,
-      system: system_prompt(File.cwd!()),
-      tools: @tools,
-      messages: messages
-    }
+    body = request_body(messages, File.cwd!())
 
     # --debug: dump the full request body (the whole context) on every call.
     if Application.get_env(:go, :debug, false) do

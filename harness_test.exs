@@ -108,4 +108,22 @@ defmodule GoTest do
       assert String.ends_with?(message, "</project_instructions>\n\nfix the bug")
     end
   end
+
+  describe "prompt caching" do
+    test "caches the tools + system prefix and the growing conversation" do
+      body = Go.request_body([%{role: "user", content: "hi"}], "/some/project")
+
+      assert body.cache_control == %{type: "ephemeral"}
+      assert [%{type: "text", text: text, cache_control: %{type: "ephemeral"}}] = body.system
+      assert text == Go.system_prompt("/some/project")
+    end
+
+    test "the cached prefix is byte-identical across requests" do
+      first = Go.request_body([%{role: "user", content: "a"}], "/p")
+      later = Go.request_body([%{role: "user", content: "b"}], "/p")
+
+      assert Map.take(first, [:model, :system, :tools]) ==
+               Map.take(later, [:model, :system, :tools])
+    end
+  end
 end
