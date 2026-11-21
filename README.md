@@ -6,52 +6,114 @@ tools the model asks for on your machine, sends the results back, and repeats
 until the model has an answer. The loop is a handful of short functions, and
 it prints every step as it runs.
 
+It is built to get things done fast, with no brakes. The model has a real
+bash shell and your permissions, and nothing asks you before a tool runs.
+See [Safety](#safety).
+
 ```zsh
 source .env                               # API_KEY=..., optional API_MODEL=...
-elixir harness.exs "Grep harness.exs for the line defining @max_output and tell me its value in one line."
+elixir harness.exs "Find the line defining @max_output in harness.exs and tell me its value in one line."
 ```
 
 ```text
-[turn 1] stop_reason=tool_use | prompt 2105 tokens (cache read 0, cache write 2101, uncached 4) | output 103 tokens
--> Grep %{"max_results" => 5, "path" => "@max_output", "pattern" => "@max_output"}
-<- error, 38 chars: No such file or directory: @max_output
-[turn 2] stop_reason=tool_use | prompt 2226 tokens (cache read 2101, cache write 123, uncached 2) | output 163 tokens
--> Grep %{"max_results" => 5, "path" => "harness.exs", "pattern" => "@max_output"}
-<- ok, 341 chars: harness.exs:160:  @max_output 50_000
-`@max_output` is set to `50_000` on line 160 of harness.exs.
-[turn 3] stop_reason=end_turn | prompt 2533 tokens (cache read 2224, cache write 307, uncached 2) | output 28 tokens
+[turn 1] stop_reason=tool_use | prompt 1656 tokens (cache read 0, cache write 1652, uncached 4) | output 69 tokens
+-> Bash %{"command" => "grep -rn \"@max_output\" --include=*.exs . | head -20"}
+<- ok, 440 chars: ./harness.exs:117:  @max_output 50_000
+`@max_output` is set to `50_000` (line 117 of harness.exs).
+[turn 2] stop_reason=end_turn | prompt 1916 tokens (cache read 1652, cache write 262, uncached 2) | output 28 tokens
 
 >
 ```
 
-This one prompt took three requests. The model's first Grep used the wrong
-path and got an error back. It fixed the path, found the line, then answered
-without asking for a tool, which ended its turn (`end_turn`). The harness is
-now waiting at `>` for your next message.
+This one prompt took two requests. In the first, the model asked for a tool
+(`stop_reason=tool_use`): a `grep | head` pipeline in Bash. The harness ran
+it and sent back the output. In the second, the model answered without
+asking for a tool, which ended its turn (`end_turn`). The harness is now
+waiting at `>` for your next message.
 
 ## Contents
 
+- [Map of harness.exs](#map-of-harnessexs)
+- [Glossary](#glossary)
 - [Running it](#running-it)
 - [Features](#features)
 - [From prompt to reply](#from-prompt-to-reply)
 - [How the agent decides to stop](#how-the-agent-decides-to-stop)
 - [What the model sees](#what-the-model-sees)
 - [Tools](#tools)
+- [How to add a tool](#how-to-add-a-tool)
 - [Reading the output](#reading-the-output)
 - [Streaming](#streaming)
 - [Prompt caching](#prompt-caching)
 - [Compaction (/compact)](#compaction-compact)
 - [Safety](#safety)
-- [Code map](#code-map)
 - [Tests](#tests)
 - [Limitations](#limitations)
 
+## Map of harness.exs
+
+`harness.exs` is one module, `Go`, of about 1,000 lines. It has six parts.
+Each part teaches one idea, and you can read them in any order. Banner
+comments (`# ---- The agent loop ----`) mark the loop, compaction, streaming
+and tools sections in the file. The request part has no banner; look for
+the function names below.
+
+| Part | Functions | What it teaches | Where in the file | Read more |
+|---|---|---|---|---|
+| **1. The loop** | `run/1`, `start/1`, `loop/2`, `next_prompt/2`, `add_user_text/2`, `run_tools/1` | An agent is a loop. Send the conversation, run any tools the model asked for, append the results, and repeat until the model stops asking. Then wait for the user. | "The agent loop" banner; `run_tools/1` sits after the streaming section | [From prompt to reply](#from-prompt-to-reply), [How the agent decides to stop](#how-the-agent-decides-to-stop) |
+| **2. The request** | `system_prompt/2`, `machine/0`, `first_message/2`, `request_body/2`, `call_model/2` | What one API call contains: model, `max_tokens`, a system prompt that states the facts about the machine, tool schemas, the whole conversation, and the two cache breakpoints. The model remembers nothing between calls. | Just above the loop banner; `call_model/2` just after compaction | [What the model sees](#what-the-model-sees), [Prompt caching](#prompt-caching) |
+| **3. Streaming** | `new_stream/0`, `consume_chunk/2`, `apply_event/2`, `finish_stream/1` | Rebuilding a complete response from server-sent events, so text prints while it's written and the rest of the loop never knows it was streamed | "Streaming" banner | [Streaming](#streaming) |
+| **4. Compaction** | `compact/3`, `compaction_prompt/1`, `extract_summary/1`, `compacted_messages/2` | Context is finite. `/compact` swaps the whole conversation for a summary that the model writes. | "Compaction" banner | [Compaction](#compaction-compact) |
+| **5. Tools** | `@tools`, `execute_tool/2` | A tool has two halves: a JSON schema that tells the model what it may ask for, and an Elixir clause that does the work and returns `{output, is_error}` | `@tools` near the top; `execute_tool/2` under the "Tools" banner | [Tools](#tools), [How to add a tool](#how-to-add-a-tool) |
+| **6. The Bash tool** | `@bash_env`, `run_bash/2`, `collect_output/3`, `kill_port/1` | Running a real shell without letting it hang the session: empty stdin, no editor or pager, a deadline, and a kill | Attributes above `system_prompt/2`; functions after `execute_tool/2` | [The Bash tool](#the-bash-tool) |
+
+Supporting pieces:
+
+| Piece | What it is |
+|---|---|
+| `Mix.install([{:req, "0.7.5"}])` | The only dependency, pinned so every install is the same |
+| `@max_tokens`, `@max_output`, `@compact_hint_tokens` | Limits: 128,000 output tokens per reply, 50,000 characters per tool result, and the prompt size at which the status line suggests `/compact` |
+| `@bash_timeout`, `@bash_max_timeout`, `@bash_max_bytes` | Bash's default timeout (120 s), its upper limit (600 s), and the most output it keeps in memory while a command runs (1 MB) |
+| `@known_programs` | The programs the system prompt reports as installed, if they are |
+| `turn_status/3`, `result_summary/2` | The status line and the `->` / `<-` lines you see in the terminal |
+| `@commands`, `help_text/0`, `read_user_input/0`, `parse_input/1` | The `>` prompt: messages, `/help`, `/compact`, and `exit` |
+| `truncate/1` | Cuts any tool result to 50,000 characters and says so |
+| Entry point (bottom of file) | Parses `--debug` and calls `Go.run/1`. It doesn't run when the tests load the file |
+
+## Glossary
+
+- **Context window**: the most tokens the model can take in one request:
+  tools, system prompt and the whole conversation together. Every request
+  resends the whole conversation, so a session gets closer to this limit
+  with every turn.
+- **Compaction**: replacing the conversation with a shorter summary so a
+  session fits in the context window again. Here it runs only when you type
+  `/compact`.
+- **`stop_reason`**: a field on every API response that says why the model
+  stopped: `tool_use`, `end_turn`, `max_tokens` and so on. The loop looks at
+  this field and nothing else to decide what to do next.
+- **`tool_use` / `tool_result`**: the two halves of a tool call. In its
+  reply the model sends a `tool_use` block with a tool name, an input and an
+  id. The harness runs the tool and sends back a `tool_result` block in the
+  next user message, with the same id (`tool_use_id`), the output and
+  `is_error`.
+- **`cache_control`**: a marker in the request (a cache breakpoint) that
+  asks the API to cache everything up to that point. The next request can
+  then read that prefix from cache, which is faster and costs less than
+  processing it again.
+- **SSE (server-sent events)**: the streaming format. The HTTP response
+  stays open, and the API sends small `event:`/`data:` records, separated by
+  blank lines, while the model writes.
+- **Turn**: in the status line, one request to the model. One message from
+  you can take many turns.
+
 ## Running it
 
-You need Elixir and Erlang (versions in `.tool-versions`), `curl`, and an
-Anthropic API key. Req, the HTTP client, is the only dependency. `Mix.install`
-downloads it on the first run and caches it after that. There is no mix
-project to set up.
+You need Elixir and Erlang (versions in `.tool-versions`), bash, and an
+Anthropic API key, on Linux or macOS. Req, the HTTP client, is the only
+dependency. `Mix.install` downloads it on the first run and caches it after
+that. There is no mix project to set up. Whatever else the agent uses (git,
+curl, mix, rg and so on) is whatever your machine already has.
 
 Put your settings in `.env`, which git ignores:
 
@@ -96,11 +158,13 @@ is not saved after you exit.
 - **A visible agent loop.** After every response it prints the turn number,
   why the model stopped, and how many tokens the conversation now uses. Every
   tool call prints its input and a one-line summary of its result.
-- **Eight tools:** Read, Write, Edit, Grep, WebFetch, Curl, Mix and Git
-  ([details](#tools)). There is no shell tool, so the model can only do what
-  these tools allow.
-- **A system prompt** that tells the model what this harness is, which
-  directory it's in, which tools it has, and that there is no shell.
+- **Five tools:** Read, Write, Edit, WebFetch and Bash ([details](#tools)).
+  Bash is a real shell, so the model can use git, curl, grep, mix and
+  anything else installed, with pipes and all.
+- **No guessing about the machine.** The system prompt states the OS, the
+  bash version and which common programs are installed, so the model writes
+  commands that work here (BSD `sed` on macOS, GNU on Linux).
+- **No prompts, no allowlists.** Every tool call runs right away.
 - **AGENTS.md support.** If the working directory has an `AGENTS.md`, it is
   put in front of your first message, so the project's rules apply for the
   whole session.
@@ -153,7 +217,7 @@ Step by step, using the function names in `harness.exs`:
    `AGENTS.md` if there is one, and starts the loop.
 2. **`loop/2`** runs once per request to the model. It calls
    **`call_model/2`**, which uses **`request_body/2`** to build the request.
-   That is the model name, `max_tokens`, the system prompt, the eight tool
+   That is the model name, `max_tokens`, the system prompt, the five tool
    definitions, and the *entire* conversation so far. The model has no memory
    between requests; the conversation in `messages` is its only memory, and
    every request sends all of it.
@@ -176,8 +240,8 @@ Step by step, using the function names in `harness.exs`:
    `messages` with a summary first ([below](#compaction-compact)).
 
 A single prompt can lead to many requests. "Fix the failing test" might be
-Read, Edit, Mix test, Edit, Mix test, then a final answer: six requests in one
-turn, each a little bigger than the last.
+Read, Edit, `mix test`, Edit, `mix test`, then a final answer: six requests
+in one turn, each a little bigger than the last.
 
 ## How the agent decides to stop
 
@@ -202,8 +266,8 @@ So the model keeps working for as long as it keeps calling tools. When it
 thinks it has what it needs, it writes a reply without a tool call, the API
 reports `end_turn`, and control comes back to you. Nothing in the harness
 limits the number of tool calls in a turn. The model's own judgement and the
-system prompt's guidance (verify changes with Mix, say so if a tool is
-missing) shape when it stops.
+system prompt's guidance (verify changes with `mix test`, say so if a
+program is missing) shape when it stops.
 
 The *session* ends only when you say so: `exit`, `quit`, Ctrl-D, or `exit` at
 the retry prompt after an API error.
@@ -212,21 +276,37 @@ the retry prompt after an API error.
 
 Every request has the same four parts, in this order:
 
-1. **Tools**: the eight tool definitions in `@tools`. Each has a name, a
+1. **Tools**: the five tool definitions in `@tools`. Each has a name, a
    description that tells the model when and how to use it, and a JSON input
    schema. `strict: true` makes the API guarantee that tool inputs match the
    schema.
-2. **System prompt** (`system_prompt/1`): what this harness is, the working
-   directory, the tool names (built from `@tools` so the two can't drift),
-   that there is no shell, to verify code changes with Mix, which Git
-   subcommands and stash actions it has (built from `@git_subcommands` and
-   `@git_stash_actions`), to only stage or commit with Git when you ask, and
-   to keep replies short.
+2. **System prompt** (`system_prompt/2`): what this harness is, the tool
+   names (built from `@tools` so the two can't drift), that nothing asks
+   before a tool runs, and the working directory. Then the facts about the
+   machine, which `machine/0` detects once per session:
+
+   ```text
+   Machine: Linux 6.8.0, bash 5.1.16. Installed: git, curl, grep, sed, awk, find,
+   jq, make, mix, elixir, erl, node, npm, python3, docker.
+   ```
+
+   On macOS that line also says the tools are the BSD versions (`sed -i`
+   needs an argument, `grep` has no `-P`) and that there is no `timeout`
+   command. The prompt then explains how Bash runs commands (a fresh shell
+   each time, empty stdin, no editor or pager) and says to use Read, Edit and
+   Write for files, to verify Elixir changes with `mix compile` and
+   `mix test`, to say so when a program is missing, and to keep replies
+   short.
 3. **First user message** (`first_message/2`): the contents of `AGENTS.md`
    wrapped in `<project_instructions>`, if the file exists, followed by your
    prompt.
 4. **The rest of the conversation**: every reply, tool call, tool result and
    message since then, in order.
+
+The request goes to `POST https://api.anthropic.com/v1/messages` with your
+`API_KEY` in the `x-api-key` header, an `anthropic-version` header, and
+`stream: true` (see [Streaming](#streaming)). The harness waits up to 10
+minutes for a reply.
 
 Run with `--debug` to see the full request for every turn.
 
@@ -237,76 +317,130 @@ Run with `--debug` to see the full request for every turn.
 | **Read** | Returns a file's contents | Cut at 50,000 characters |
 | **Write** | Creates or overwrites a file, creating folders as needed | |
 | **Edit** | Replaces one exact occurrence of `old_string` with `new_string` | `old_string` must not be empty and must appear exactly once |
-| **Grep** | Regex search of a file or folder, returning `file:line:text` | Optional `only_matching`, `case_insensitive`, `max_results` (default 100). Folder searches skip `_build`, `deps`, `node_modules` and hidden folders |
 | **WebFetch** | Plain HTTP GET of a URL | 30-second timeout, body cut at 50,000 characters |
-| **Curl** | Runs the real `curl` with an array of arguments, for headers, cookies, methods and request bodies | Adds `--silent --show-error --max-time 60` and reports the HTTP status and exit code. Output cut at 50,000 characters |
-| **Mix** | Runs one mix task in the working directory | Only `deps.get`, `compile`, `test` and `format`, with no extra arguments |
-| **Git** | Runs one git subcommand with an array of arguments in the working directory, to inspect and search history and make local commits | Only `status`, `log`, `diff`, `show`, `add`, `commit` and `stash`. Some flags are refused (see below). Output cut at 50,000 characters |
+| **Bash** | Runs any command with `bash -c` in the working directory and returns stdout and stderr together, then the exit code | Killed after `timeout` seconds (default 120, max 600). Output cut at 50,000 characters |
 
-Without a shell, the model can't pipe output between programs. To search a
-large web page it saves the page with `Curl -o page.html`, then runs `Grep`
-on the file. The system prompt and the Curl description both point it to
-this approach.
+Read, Write and Edit stay as separate tools even though Bash could do the
+same jobs. An exact-match Edit is far more reliable than the model rewriting
+files with `sed` or heredocs, and it fails loudly when the text isn't found.
 
-### The Git tool
+### The Bash tool
 
-Git lets the agent search history and make local commits, but nothing that
-talks to a remote (`push`, `pull`, `fetch`) or rewrites history (`reset`,
-`rebase`, `commit --amend`). The system prompt lists the subcommands and
-stash actions it has, generated from the same lists the tool checks, and
-says it can't talk to a remote, reset, rebase or amend. It tells the model
-to use Git freely for reading, but to stage, commit or stash only when you
-ask, and to check `status` and `diff` first. The Git tool's own description
-repeats the details, including the refused flags.
+Bash gives the model everything a shell has: pipes, redirects, `&&`, globs,
+git (including `push`, `reset` and `rebase`), curl, mix, package managers.
+Nothing is filtered. The only work the harness does is to make sure a
+command can't hang the session, because there is no terminal for it to talk
+to:
 
-Searching history uses `git log`:
+- **Stdin is empty.** The script starts with `exec </dev/null`, so a command
+  that reads input (`cat`, a `[y/N]` prompt) gets end-of-file and moves on.
+- **No editor, pager or password prompt.** `GIT_EDITOR`, `EDITOR` and
+  `VISUAL` are set to `true`, `PAGER` and `GIT_PAGER` to `cat`, and
+  `GIT_TERMINAL_PROMPT` to `0`. So `git commit` without `-m` fails instead of
+  waiting for an editor, and `git log` prints instead of opening `less`.
+- **A deadline.** `run_bash/2` runs bash in an Erlang Port instead of
+  `System.cmd`, which has no timeout (and macOS has no `timeout` command).
+  If the command is still running at the deadline, `kill_port/1` kills the
+  shell and the processes it started, and the result ends with
+  `(killed after N seconds)` and is an error. The model can pass a longer
+  `timeout` for slow builds, or start a server in the background with `&`.
+- **Bounded output.** At most 1 MB of output is kept while the command runs,
+  so `yes` can't fill memory before the deadline. Bytes that aren't valid
+  UTF-8 become `�`, because the result goes back to the API as JSON.
 
-| To find | Arguments |
-|---|---|
-| Commits whose message mentions a word | `log --oneline --grep=cache` (add `-i` to ignore case) |
-| Commits that added or removed some text | `log --oneline -S "hello cache"` |
-| Commits whose changes match a regex | `log --oneline -G "def \w+_stream"` |
-| One commit in full | `show <sha>` |
+Each call is a fresh shell: `cd` and `export` don't carry over to the next
+call, so the model chains them (`cd lib && ls`). A non-zero exit code is
+reported as an error, which tells the model the command failed.
 
-`git_refusal/2` checks every call before it runs. It refuses:
+When a tool fails, for example because a file is missing, an Edit
+`old_string` isn't found, or a command exits non-zero, the error goes back
+to the model as a result with `is_error: true`. Models usually fix their call
+and try again. When a clause raises, `run_tools/1` rescues the exception and
+sends its message as an error result. A tool name with no clause gets
+`Unknown tool: <name>` back from the catch-all `execute_tool/2` clause.
 
-| Refused | Why |
-|---|---|
-| Any subcommand not in `@git_subcommands` | Keeps the tool to reading history and local commits |
-| `commit --amend` | Rewrites the last commit |
-| `commit --no-verify` / `-n` | Skips the repo's commit hooks |
-| `add --force` / `-f` | Adds files `.gitignore` excludes, such as `.env` |
-| `stash drop`, `stash clear` | Deletes stashes (allowed: `push`, `list`, `show`, `pop`, `apply`) |
-| `--interactive`, `--patch`, `--edit` and their short forms on `add`, `commit`, `stash` | They wait for a terminal or editor, which would hang the session |
-| `--output`, `--ext-diff` on any subcommand | Writes a file outside git's control / runs an external program |
+## How to add a tool
 
-The check also catches bundled short flags (`-fA` contains `-f`) and long
-flags with a value (`--output=x`), and skips everything after `--`, which
-git treats as file paths. The subcommand is always the first argument, so the
-model can't add global options such as `-c` or `--git-dir` in front of it.
-Git runs with `GIT_EDITOR=true` and no pager: a commit without `-m` fails
-instead of waiting for an editor that will never open.
+Adding a tool shows the core idea of this demo: **the model only ever sees a
+schema, and the harness decides what actually runs.** Bash can already run
+any program, so a new tool is worth adding when it does something the shell
+can't, or does it more reliably. The example below adds `Ask`, which asks
+you a question in the terminal. Bash can't do that, because its stdin is
+empty.
 
-In a test in a throwaway clone of this repo, the agent found the streaming
-commit with `log --grep` and `log -S`, staged and committed one new file
-after checking `diff --cached`, and when asked to amend it, explained that
-the tool refuses `--amend`.
+It takes up to three edits to `harness.exs`:
 
-When a tool fails, for example because a file is missing or an Edit
-`old_string` isn't found, the error message goes back to the model as a
-result with `is_error: true`. Models usually fix their call and try again;
-the example at the top of this README shows this happening.
+**1. If the tool needs a limit, add it as a module attribute.** Put it next
+to the `@bash_*` attributes, above `@tools`, so the schema in step 2 can use
+it: a list of allowed values for an `enum`, a size, a timeout. `Ask` needs
+none, so it skips this step. A tool that should only accept some values
+would add, for example, `@npm_scripts ~w(test lint build)`, use it as the
+`enum` in its schema, and check it again with a `when script in
+@npm_scripts` guard on its clause.
 
-To add a tool: add its definition to `@tools` and add an `execute_tool/2`
-clause with the same name that returns `{output, is_error}`. The system
-prompt picks up the new name automatically.
+**2. Add a schema to `@tools`.** The `name` is how the model calls the tool.
+The `description` is how it decides *when* to call it, so say what the tool
+returns and when not to use it. Under `strict: true`, the input must match
+`input_schema`. `additionalProperties: false` is required with
+`strict: true`.
+
+```elixir
+%{
+  name: "Ask",
+  description:
+    "Ask the user a question in the terminal and return their answer. Use it when " <>
+      "you need a decision or a fact only the user has; don't use it for things you " <>
+      "can find out with your other tools.",
+  input_schema: %{
+    type: "object",
+    properties: %{question: %{type: "string", description: "The question to ask"}},
+    required: ["question"],
+    additionalProperties: false
+  },
+  strict: true
+}
+```
+
+**3. Add an `execute_tool/2` clause.** The first argument is the tool's name
+and the second is its input, decoded from JSON with **string** keys. The
+function returns `{output, is_error}`. Put the clause **above** the
+catch-all `execute_tool(name, _input)`, or it will never match. The clause
+runs inside the harness, so it can use anything in the `Go` module, here the
+private `read_line/1` that the `>` prompt uses. Pass long output through
+`truncate/1`.
+
+```elixir
+def execute_tool("Ask", %{"question" => question}) do
+  IO.puts("\n[question] " <> question)
+
+  case read_line("answer> ") do
+    :eof -> {"The user did not answer.", true}
+    answer -> {answer, false}
+  end
+end
+```
+
+Things you get without more work:
+
+- The system prompt lists tool names from `@tools`, so the model learns that
+  `Ask` exists.
+- A failure, whether an error result or a raised exception, goes back to the
+  model as an error result it can react to.
+- The terminal prints the tool call (`-> Ask %{"question" => "..."}`) and a
+  summary of its result.
+
+Changing `@tools` changes the cached prefix, so the first request after the
+change is a cache miss. Then add a test in `harness_test.exs` that calls
+`Go.execute_tool("Ask", ...)` directly, as the Bash tests do (wrap it in
+`capture_io/2` to supply the answer). Restart the harness to load the new
+tool.
 
 ## Reading the output
 
 ```text
-[turn 2] stop_reason=tool_use | prompt 2226 tokens (cache read 2101, cache write 123, uncached 2) | output 163 tokens
--> Grep %{"path" => "harness.exs", "pattern" => "@max_output"}
-<- ok, 341 chars: harness.exs:160:  @max_output 50_000
+[turn 1] stop_reason=tool_use | prompt 1656 tokens (cache read 0, cache write 1652, uncached 4) | output 69 tokens
+-> Bash %{"command" => "grep -rn \"@max_output\" --include=*.exs . | head -20"}
+<- ok, 440 chars: ./harness.exs:117:  @max_output 50_000
 ```
 
 - **`[turn N]`** counts requests to the model in this session, not your
@@ -388,16 +522,18 @@ cache breakpoints:
 1. **On the system prompt.** The API orders a request as tools, then system,
    then messages, so this breakpoint caches the tools and system prompt
    together. They are the same for every request and every session in the
-   same folder.
+   same folder on the same machine.
 2. **Automatic, at the end of the conversation** (the top-level
    `cache_control`). The API places it on the last block and moves it as the
    conversation grows, so each request reads the previous request from cache
    and only pays full price for what is new.
 
-In the example above, turn 2 read 2,101 tokens from cache and processed only
-125 new ones. Cache entries last 5 minutes from their last use. Anything that
+In the example above, turn 2 read 1,652 tokens from cache and processed only
+264 new ones. Cache entries last 5 minutes from their last use. Anything that
 changes the cached bytes, such as a different tool list, system prompt or
-model, causes a miss.
+model, causes a miss. That is why `machine/0` detects the machine only once
+per session: if the agent installs `rg` partway through, the system prompt
+doesn't change and the cache still hits.
 
 ## Compaction (/compact)
 
@@ -430,7 +566,9 @@ What happens (`compact/3`):
    will remember.
 3. It starts a new conversation that holds only `AGENTS.md` (if there is one)
    and the summary, marked as `<earlier_conversation_summary>`
-   (`compacted_messages/2`). Your next message is added to it.
+   (`compacted_messages/2`). Your next message is appended to that same user
+   message (`add_user_text/2`), not sent as a new one, because the API
+   requires user and assistant messages to alternate.
 
 Nothing from before the summary is replayed: no earlier messages, tool
 results or thinking blocks. This is deliberate. Editing or trimming an old
@@ -451,48 +589,26 @@ harness prints `[compact failed]` and the conversation is left unchanged.
 
 ## Safety
 
-This is a learning tool, not a sandbox.
+There isn't any, on purpose. This agent is all gas and no brakes.
 
-- **Tools run with your permissions, and nothing asks you first.** Write and
-  Edit can change any file you can change, and Read can read any file you can
-  read, including outside the working directory.
-- **There is no shell.** Curl, Mix and Git call their programs directly
-  with an argument list, so an argument like `"x; rm -rf ~"` is passed as
-  text and never run as a command. Mix only accepts its four allowed tasks.
-- **Git can commit, but only locally.** It can't push, reset, rebase or
-  amend, and it refuses `add --force`, so ignored files such as `.env` stay
-  out. A plain `git add .` still stages anything that isn't ignored, so keep
-  secrets in `.gitignore`. Commits run the repo's own hooks, as they would
-  for you.
-- **Curl and WebFetch can reach any URL.** The model can send what it reads
-  (files, `.env`) to the network if it decides to.
-- **AGENTS.md is followed as your instructions.** Only run the agent in
-  projects whose `AGENTS.md` you trust.
-- **`--debug` prints everything,** including file contents and any cookies
-  or tokens passed to Curl. Don't share that output.
+- **Every tool call runs immediately, with your permissions.** Bash can run
+  anything you can: `rm -rf`, `git push --force`, `git reset --hard`,
+  `sudo` if it doesn't need a password, `curl ... | sh`. Write and Edit can
+  change any file you can change, anywhere.
+- **Nothing is filtered.** There is no allowlist, no denylist and no
+  confirmation step. The only guidance is the system prompt, and the model
+  can ignore it.
+- **The network is open.** Bash, curl and WebFetch can send anything the
+  model reads, including `.env`, to any URL.
+- **AGENTS.md is followed as your instructions,** and so, in practice, is
+  anything the model reads that tells it what to do: a web page, a README,
+  a code comment. Only point it at projects and content you trust.
+- **`--debug` prints everything,** including file contents and any tokens
+  used in commands. Don't share that output.
 
-## Code map
-
-`harness.exs`, top to bottom:
-
-| Part | What it is |
-|---|---|
-| `Mix.install([{:req, "0.7.5"}])` | The single dependency, pinned so every install is the same |
-| `@mix_tasks`, `@git_subcommands`, `@git_blocked_flags`, `@git_stash_actions` | What the Mix and Git tools allow and refuse |
-| `@tools` | The eight tool definitions sent to the API |
-| `@max_output`, `@grep_skip_dirs` | The 50,000-character output limit and the folders Grep skips |
-| `system_prompt/1`, `first_message/2`, `request_body/2` | What goes into each request |
-| `run/1`, `start/1`, `loop/2`, `next_prompt/2`, `add_user_text/2` | The agent loop |
-| `call_model/2` | One streamed request to the Messages API; returns `{:ok, response}` or `{:error, reason}` |
-| `new_stream/0`, `consume_chunk/2`, `apply_event/2`, `finish_stream/1` | Rebuilding the response from the streamed events |
-| `turn_status/3`, `run_tools/1`, `result_summary/2` | Running tools and printing what happens |
-| `@commands`, `help_text/0` | The commands `/help` lists; add a new one here and in `next_prompt/2` |
-| `read_user_input/0`, `parse_input/1` | The `>` prompt: messages, `/commands` and `exit` |
-| `compact/3`, `compaction_prompt/1`, `extract_summary/1`, `compacted_messages/2` | `/compact` |
-| `execute_tool/2` | One clause per tool |
-| `git_refusal/2` | Why a Git call is refused, or `nil` |
-| `truncate/1`, `files_under/1`, `grep_lines/4` | Helpers for the tools |
-| Entry point (bottom of file) | Parses `--debug` and calls `Go.run/1`; skipped when the tests load the file |
+If you want brakes, run it in a container or a throwaway VM, or with a
+user account that can't reach anything you care about. Commit your work
+before a session, so `git` can get it back.
 
 ## Tests
 
@@ -500,13 +616,19 @@ This is a learning tool, not a sandbox.
 elixir harness_test.exs
 ```
 
-The tests load `harness.exs` without starting a session and check the tools,
-the system prompt, AGENTS.md loading, the cache settings, input and slash
-command parsing, the compaction steps (everything except the API call), the
-status line, and the streaming parser. The parser tests feed in a sample
-event stream, both whole and split into chunks as small as one byte, and
-check that every split gives the same reply. None of them call the API. The script exits with a non-zero
-status if any test fails, so it works in CI or a git hook.
+The tests load `harness.exs` without starting a session and check the
+tools, the system prompt, AGENTS.md loading, the cache settings, input and
+slash command parsing, the compaction steps (everything except the API
+call), the status line, and the streaming parser.
+
+The Bash tests run real commands. They check pipes and exit codes, stderr,
+the working directory, empty stdin, the timeout kill, invalid UTF-8, and
+that `git commit` fails instead of waiting for an editor. The streaming
+tests feed in a sample event stream, both whole and split into chunks as
+small as one byte, and check that every split gives the same reply.
+
+None of them call the API. The script exits with a non-zero status if any
+test fails, so it works in CI or a git hook.
 
 ## Limitations
 
@@ -519,12 +641,22 @@ status if any test fails, so it works in CI or a git hook.
   turn, and the next request is likely to fail. The status line shows
   `stop_reason=max_tokens` when this happens. The limit is per reply; the
   conversation as a whole can be far larger.
+- **Bash forgets between calls.** `cd` and `export` last for one command
+  only.
+- **A timeout kills the shell and its direct children.** A grandchild
+  process that detached itself (a daemon, `nohup`) can keep running.
+- **Interactive programs can't be used.** Anything that needs a terminal
+  (`vim`, `git rebase -i`, `top`) gets empty stdin and no TTY. It either
+  fails or runs until the timeout.
 - **Tool calls aren't shown while they stream.** Only text is printed as it
   arrives; a tool call appears once its input is complete.
 - **Tools run one at a time,** even when the model asks for several at once.
-- **Read has no offset.** Large files are cut at 50,000 characters; use Grep
-  to find the part you need.
+- **Read has no offset.** Large files are cut at 50,000 characters; the
+  model can use `grep -n` and `sed -n` in Bash to find and print the part it
+  needs.
 - **Nothing is saved.** History is lost when you exit, and a crash (for
   example Ctrl-C) loses it too.
+- **A missing `API_KEY` crashes the session** on the first request instead
+  of offering a retry. `source .env` before you start.
 - **Code changes need a restart.** If the agent edits `harness.exs`, the
   change takes effect in the next session.

@@ -16,69 +16,57 @@ defmodule GoTest do
     assert function_exported?(Go, :run, 1)
   end
 
-  describe "Curl tool" do
-    @tag :tmp_dir
-    test "runs native curl and reports the body and status", %{tmp_dir: dir} do
-      path = Path.join(dir, "page.txt")
-      File.write!(path, "weekly limit: 42% left")
-
-      {output, error?} = Go.execute_tool("Curl", %{"args" => ["file://" <> path]})
+  describe "Bash tool" do
+    test "runs a real shell: pipes, &&, variables, and the exit code" do
+      {output, error?} =
+        Go.execute_tool("Bash", %{"command" => "x=hi; echo $x | tr a-z A-Z && echo ok"})
 
       refute error?
-      assert output =~ "weekly limit: 42% left"
-      assert output =~ "(exit 0)"
+      assert output == "HI\nok\n\n(exit 0)"
     end
 
-    test "passes arguments without a shell" do
-      {output, error?} = Go.execute_tool("Curl", %{"args" => ["file:///nonexistent; echo pwned"]})
-
-      assert error?
-      refute output =~ ~r/^pwned$/m
-    end
-  end
-
-  describe "Grep tool" do
-    @tag :tmp_dir
-    test "finds matching lines and only-matching text", %{tmp_dir: dir} do
-      File.write!(
-        Path.join(dir, "page.html"),
-        "<html>\n<h1 class=\"t\">Hello</h1><h2>Sub</h2>\n</html>"
-      )
-
-      {out, false} = Go.execute_tool("Grep", %{"pattern" => "<h[12]", "path" => dir})
-      assert out =~ ~r/page\.html:2:<h1/
-
-      {out, false} =
-        Go.execute_tool("Grep", %{
-          "pattern" => "<h[12][^>]*>[^<]*",
-          "path" => Path.join(dir, "page.html"),
-          "only_matching" => true,
-          "max_results" => 1
-        })
-
-      assert out =~ ~s(page.html:2:<h1 class="t">Hello)
-      refute out =~ "Sub"
-      assert out =~ "stopped at max_results=1"
+    test "a non-zero exit is an error and stderr is included" do
+      assert {"oops\n\n(exit 3)", true} =
+               Go.execute_tool("Bash", %{"command" => "echo oops >&2; exit 3"})
     end
 
     @tag :tmp_dir
-    test "reports no matches and bad paths", %{tmp_dir: dir} do
-      assert {"No matches", false} = Go.execute_tool("Grep", %{"pattern" => "zzz", "path" => dir})
-
-      assert_raise RuntimeError, fn ->
-        Go.execute_tool("Grep", %{"pattern" => "x", "path" => "/nope"})
-      end
+    test "runs in the working directory", %{tmp_dir: dir} do
+      File.cd!(dir, fn ->
+        {output, false} = Go.execute_tool("Bash", %{"command" => "pwd -P"})
+        assert output =~ Path.basename(dir)
+      end)
     end
-  end
 
-  describe "Mix tool" do
-    test "rejects tasks outside the allowlist" do
-      for task <- ["run", "deps.clean", "test --eval System.halt", "", "archive.install"] do
-        {output, error?} = Go.execute_tool("Mix", %{"task" => task})
+    test "stdin is empty, so a command that reads input doesn't hang" do
+      assert {"0\n\n(exit 0)", false} =
+               Go.execute_tool("Bash", %{"command" => "cat | wc -c | tr -d ' '"})
+    end
 
-        assert error?
-        assert output =~ "Mix task not allowed"
-      end
+    test "kills a command that runs past its timeout" do
+      started = System.monotonic_time(:millisecond)
+
+      {output, true} =
+        Go.execute_tool("Bash", %{"command" => "echo started; sleep 30", "timeout" => 1})
+
+      assert output =~ "started"
+      assert output =~ "(killed after 1 seconds)"
+      assert System.monotonic_time(:millisecond) - started < 5_000
+    end
+
+    test "turns invalid UTF-8 into replacement characters" do
+      {output, false} = Go.execute_tool("Bash", %{"command" => "printf 'a\\377b'"})
+      assert String.valid?(output)
+      assert output =~ "a\uFFFDb"
+    end
+
+    @tag :tmp_dir
+    test "git never waits for an editor", %{tmp_dir: dir} do
+      File.cd!(dir, fn ->
+        {_, 0} = System.cmd("git", ["init", "-q"])
+        {output, true} = Go.execute_tool("Bash", %{"command" => "git commit --allow-empty"})
+        assert output =~ "(exit 1)"
+      end)
     end
   end
 
@@ -91,17 +79,31 @@ defmodule GoTest do
       assert prompt =~ "Your only tools are\n#{names};"
     end
 
-    test "system prompt states the Git subset and wraps at 80 characters" do
-      prompt = Go.system_prompt("/some/project")
+    test "system prompt states the machine and wraps at 80 characters" do
+      machine = %{
+        os: "macOS",
+        os_version: nil,
+        bash: "3.2.57",
+        programs: ~w(git curl rg grep sed awk find jq make mix elixir erl node npm python3)
+      }
 
-      assert prompt =~
-               "Git only runs these subcommands: status, log, diff, show, add, commit, stash."
+      prompt = Go.system_prompt("/some/project", machine)
 
-      assert prompt =~ "Its stash only allows push, list, show, pop, apply."
+      assert prompt =~ "Machine: macOS, bash 3.2.57."
+      assert prompt =~ "BSD versions"
+      assert String.replace(prompt, "\n", " ") =~ "Installed: git, curl, rg,"
 
       for line <- String.split(prompt, "\n") do
         assert String.length(line) <= 80, "system prompt line is too long: #{line}"
       end
+    end
+
+    test "detects this machine once per session" do
+      machine = Go.machine()
+
+      assert machine.bash =~ ~r/^\d+\.\d+/
+      assert "git" in machine.programs
+      assert Go.machine() == machine
     end
 
     @tag :tmp_dir
@@ -165,23 +167,6 @@ defmodule GoTest do
 
       assert output =~ "(truncated: showing the first 50000 of 60000 characters"
       assert String.length(output) < 50_200
-    end
-
-    @tag :tmp_dir
-    test "Grep skips _build, deps and node_modules unless asked", %{tmp_dir: dir} do
-      for sub <- ["lib", "deps/req", "_build/dev", "node_modules/x"] do
-        File.mkdir_p!(Path.join(dir, sub))
-        File.write!(Path.join([dir, sub, "f.ex"]), "needle")
-      end
-
-      {out, false} = Go.execute_tool("Grep", %{"pattern" => "needle", "path" => dir})
-      assert out =~ "lib/f.ex"
-      refute out =~ ~r{/(deps|_build|node_modules)/}
-
-      {out, false} =
-        Go.execute_tool("Grep", %{"pattern" => "needle", "path" => Path.join(dir, "deps")})
-
-      assert out =~ "deps/req/f.ex"
     end
 
     test "a blank prompt asks at > and blank lines are skipped" do
@@ -473,72 +458,6 @@ defmodule GoTest do
         |> List.insert_at(7, delta(1, %{"type" => "citations_delta", "citation" => %{}}))
 
       assert run_stream(sse(events), 1000) == run_stream(sse(@reply), 1000)
-    end
-  end
-
-  describe "Git tool" do
-    test "refuses subcommands, stash actions and flags outside the rules" do
-      refute Go.git_refusal("status", [])
-      refute Go.git_refusal("commit", ["-am", "fix the -n bug"])
-      refute Go.git_refusal("log", ["-n", "5", "--grep=cache"])
-      refute Go.git_refusal("stash", [])
-      refute Go.git_refusal("stash", ["pop"])
-      refute Go.git_refusal("add", ["--", "--force"])
-
-      assert Go.git_refusal("push", []) =~ "subcommand \"push\" is not allowed"
-      assert Go.git_refusal("reset", ["--hard"]) =~ "not allowed"
-      assert Go.git_refusal("commit", ["--amend", "-m", "x"]) =~ "rewrites the last commit"
-
-      assert Go.git_refusal("commit", ["--no-verify", "-m", "x"]) =~
-               "skips the repo's commit hooks"
-
-      assert Go.git_refusal("commit", ["-nm", "x"]) =~ "-n is not allowed"
-      assert Go.git_refusal("add", ["-fA"]) =~ "add -f is not allowed"
-      assert Go.git_refusal("add", ["-p"]) =~ "needs a terminal"
-      assert Go.git_refusal("log", ["--output=/tmp/x"]) =~ "writes output to a file"
-      assert Go.git_refusal("diff", ["--ext-diff"]) =~ "external diff program"
-      assert Go.git_refusal("stash", ["drop"]) =~ "git stash drop is not allowed"
-      assert Go.git_refusal("stash", ["clear"]) =~ "git stash clear is not allowed"
-      assert Go.git_refusal("stash", ["-p"]) =~ "needs a terminal"
-    end
-
-    @tag :tmp_dir
-    test "commits, searches history and stashes in a real repo", %{tmp_dir: dir} do
-      git = fn subcommand, args ->
-        Go.execute_tool("Git", %{"subcommand" => subcommand, "args" => args})
-      end
-
-      File.cd!(dir, fn ->
-        {_, 0} = System.cmd("git", ["init", "-q"])
-        {_, 0} = System.cmd("git", ["config", "user.email", "test@example.com"])
-        {_, 0} = System.cmd("git", ["config", "user.name", "Test"])
-
-        File.write!("a.txt", "hello cache\n")
-        assert {_, false} = git.("add", ["a.txt"])
-        assert {out, false} = git.("commit", ["-m", "Add caching notes"])
-        assert out =~ "Add caching notes"
-
-        assert {out, false} = git.("log", ["--oneline", "--grep=caching"])
-        assert out =~ "Add caching notes"
-        assert {out, false} = git.("log", ["--oneline", "-S", "hello cache"])
-        assert out =~ "Add caching notes"
-
-        File.write!("a.txt", "changed\n")
-        assert {_, false} = git.("stash", [])
-        assert File.read!("a.txt") == "hello cache\n"
-        assert {out, false} = git.("stash", ["list"])
-        assert out =~ "stash@{0}"
-
-        assert {"Git refused: " <> _, true} = git.("stash", ["drop"])
-        assert {out, false} = git.("stash", ["list"])
-        assert out =~ "stash@{0}"
-
-        # Without -m git would open an editor; GIT_EDITOR=true makes it give up instead.
-        File.write!("b.txt", "b\n")
-        {_, false} = git.("add", ["b.txt"])
-        assert {out, true} = git.("commit", [])
-        assert out =~ "(exit 1)"
-      end)
     end
   end
 end

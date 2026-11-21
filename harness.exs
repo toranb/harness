@@ -1,4 +1,5 @@
 # go: a tiny single-file agent harness over the Claude Messages API.
+# All gas, no brakes: tools run with your permissions and nothing asks first.
 #
 #   source .env
 #   elixir harness.exs                       # prompts at >
@@ -11,64 +12,19 @@ Mix.install([{:req, "0.7.5"}])
 
 defmodule Go do
   @moduledoc """
-  A bare-bones agent loop over the Claude Messages API with
-  client-side tools that mirror Claude Code's: Read, Write, Edit, WebFetch, Grep,
-  plus Curl, Mix and Git, which run the native `curl`, `mix` and `git`.
+  A bare-bones agent loop over the Claude Messages API with four
+  client-side tools: Read, Write, Edit and WebFetch, plus Bash, which runs
+  any command with the user's own shell and permissions. Nothing asks
+  before a tool runs.
   """
-
-  # The only mix tasks the Mix tool will run.
-  @mix_tasks ~w(deps.get compile test format)
-
-  # The git subcommands the Git tool will run: enough to inspect and search
-  # history (status, log, diff, show) and to make local commits (add,
-  # commit, stash). Nothing that talks to a remote or rewrites history.
-  @git_subcommands ~w(status log diff show add commit stash)
-
-  # Flags the Git tool refuses, per subcommand, with the reason. They would
-  # rewrite history, skip the repo's safeguards, write files outside git's
-  # control, run external programs, or wait for an editor or terminal the
-  # harness doesn't have (which would hang the session).
-  @git_blocked_flags %{
-    "commit" => [
-      {"--amend", "rewrites the last commit"},
-      {"--no-verify", "skips the repo's commit hooks"},
-      {"-n", "skips the repo's commit hooks"},
-      {"--interactive", "needs a terminal"},
-      {"--patch", "needs a terminal"},
-      {"-p", "needs a terminal"},
-      {"--edit", "needs an editor"},
-      {"-e", "needs an editor"}
-    ],
-    "add" => [
-      {"--force", "adds files that .gitignore excludes, such as .env"},
-      {"-f", "adds files that .gitignore excludes, such as .env"},
-      {"--interactive", "needs a terminal"},
-      {"-i", "needs a terminal"},
-      {"--patch", "needs a terminal"},
-      {"-p", "needs a terminal"},
-      {"--edit", "needs an editor"},
-      {"-e", "needs an editor"}
-    ],
-    "stash" => [
-      {"--patch", "needs a terminal"},
-      {"-p", "needs a terminal"}
-    ],
-    :all => [
-      {"--output", "writes output to a file"},
-      {"--ext-diff", "runs an external diff program"}
-    ]
-  }
-
-  # `git stash <action>`: the ones that delete stashes (drop, clear) are
-  # left out. No action means `push`.
-  @git_stash_actions ~w(push list show pop apply)
 
   @tools [
     %{
       name: "Read",
       description:
         "Read a file from the local filesystem and return its contents " <>
-          "(truncated to 50,000 characters; use Grep to find parts of larger files).",
+          "(truncated to 50,000 characters; for larger files, find the part you need " <>
+          "with grep -n and print it with sed -n in Bash).",
       input_schema: %{
         type: "object",
         properties: %{file_path: %{type: "string", description: "Path of the file to read"}},
@@ -124,103 +80,26 @@ defmodule Go do
       strict: true
     },
     %{
-      name: "Curl",
+      name: "Bash",
       description:
-        "Run the native `curl` command with the given arguments and return its output " <>
-          "(stdout and stderr, truncated to 50,000 characters) followed by the HTTP status. " <>
-          "Use this instead of WebFetch when you need custom headers, cookies, methods or a " <>
-          "request body. Pass each argument as its own array element exactly as the shell " <>
-          "would after removing quotes and line continuations, e.g. " <>
-          ~s|["https://example.com", "-H", "accept: text/html", "-b", "a=1; b=2"]. | <>
-          "No shell is involved, so pipes, redirects and variables do not work: to search a " <>
-          "large response, save it with -o <file> and then use Grep on that file.",
+        "Run a command with `bash -c` in the working directory and return its output " <>
+          "(stdout and stderr together, truncated to 50,000 characters) followed by the " <>
+          "exit code. A non-zero exit is reported as an error. Pipes, redirects, &&, globs " <>
+          "and variables all work. Use it for git, curl, grep or rg, mix, and any other " <>
+          "installed program. Each call is a fresh, non-interactive shell: cd and exported " <>
+          "variables don't carry over, stdin is empty, and there is no editor or pager " <>
+          "(pass -m to git commit). A command still running after `timeout` seconds " <>
+          "(default 120, max 600) is killed, so start servers in the background.",
       input_schema: %{
         type: "object",
         properties: %{
-          args: %{
-            type: "array",
-            items: %{type: "string"},
-            description: "Arguments passed to curl (do not include the word curl itself)"
-          }
-        },
-        required: ["args"],
-        additionalProperties: false
-      },
-      strict: true
-    },
-    %{
-      name: "Grep",
-      description:
-        "Search a file, or every file under a directory, for a regular expression " <>
-          "(PCRE syntax, matched line by line) and return matches as file:line:text. " <>
-          "Like `grep -n`; set only_matching to return just the matched text (`grep -o`). " <>
-          "Use it to pull specific pieces out of large files, such as a page saved with Curl -o. " <>
-          "Directory searches skip _build, deps and node_modules; pass one as the path to search it.",
-      input_schema: %{
-        type: "object",
-        properties: %{
-          pattern: %{type: "string", description: "Regular expression, e.g. <h[12][^>]*>[^<]*"},
-          path: %{type: "string", description: "File or directory to search"},
-          only_matching: %{
-            type: "boolean",
-            description: "Return only the matched text, not the whole line (default false)"
-          },
-          case_insensitive: %{type: "boolean", description: "Ignore case (default false)"},
-          max_results: %{
+          command: %{type: "string", description: "The bash command to run"},
+          timeout: %{
             type: "integer",
-            description: "Stop after this many results (default 100)"
+            description: "Seconds to wait before killing the command (default 120, max 600)"
           }
         },
-        required: ["pattern", "path"],
-        additionalProperties: false
-      },
-      strict: true
-    },
-    %{
-      name: "Mix",
-      description:
-        "Run one allowlisted mix task in the project directory and return its output " <>
-          "(stdout and stderr, truncated to 50,000 characters) followed by the exit code. " <>
-          "A non-zero exit is reported as an error. Allowed tasks: " <>
-          Enum.join(@mix_tasks, ", ") <> ".",
-      input_schema: %{
-        type: "object",
-        properties: %{
-          task: %{
-            type: "string",
-            enum: @mix_tasks,
-            description: "The mix task to run, e.g. compile or test"
-          }
-        },
-        required: ["task"],
-        additionalProperties: false
-      },
-      strict: true
-    },
-    %{
-      name: "Git",
-      description:
-        "Run one git subcommand in the working directory and return its output " <>
-          "(stdout and stderr, truncated to 50,000 characters) followed by the exit code. " <>
-          "Allowed subcommands: " <>
-          Enum.join(@git_subcommands, ", ") <>
-          ". Search history with log, e.g. args [\"--oneline\", \"--grep=cache\"] for " <>
-          "commit messages, [\"-S\", \"text\"] for commits that added or removed text, or " <>
-          "[\"-G\", \"regex\"]; then show <sha> to see one. Commit with args " <>
-          "[\"-m\", \"message\"]; there is no editor. stash allows push, list, show, pop and " <>
-          "apply. Refused: commit --amend and --no-verify, add --force, stash drop and " <>
-          "clear, interactive or editor flags, --output and --ext-diff.",
-      input_schema: %{
-        type: "object",
-        properties: %{
-          subcommand: %{type: "string", enum: @git_subcommands},
-          args: %{
-            type: "array",
-            items: %{type: "string"},
-            description: "Arguments after the subcommand, one per element (may be empty)"
-          }
-        },
-        required: ["subcommand", "args"],
+        required: ["command"],
         additionalProperties: false
       },
       strict: true
@@ -237,9 +116,31 @@ defmodule Go do
   # page can't flood the context window. truncate/1 adds a note when it cuts.
   @max_output 50_000
 
-  # Grep skips these when it walks a directory: build output and vendored
-  # dependencies are large and rarely what you're looking for.
-  @grep_skip_dirs ~w(_build deps node_modules)
+  # Bash kills a command after this many seconds unless the model asks for
+  # a different timeout, which is capped at @bash_max_timeout.
+  @bash_timeout 120
+  @bash_max_timeout 600
+
+  # Bash keeps at most this many bytes of a command's output while it runs,
+  # so something like `yes` can't fill memory before the timeout. It is
+  # well above @max_output, which truncate/1 then cuts to.
+  @bash_max_bytes 1_000_000
+
+  # Set for every Bash command so nothing waits for an editor, pager or
+  # password prompt that the harness can't show.
+  @bash_env [
+    {"GIT_EDITOR", "true"},
+    {"EDITOR", "true"},
+    {"VISUAL", "true"},
+    {"GIT_PAGER", "cat"},
+    {"PAGER", "cat"},
+    {"GIT_TERMINAL_PROMPT", "0"}
+  ]
+
+  # Programs the system prompt reports as installed (when they are), so the
+  # model doesn't have to guess what the machine has.
+  @known_programs ~w(git curl rg grep sed awk find jq make mix elixir erl node npm
+                     python3 docker gh)
 
   # What you can type at the > prompt besides a message, as shown by /help.
   # To add a command, add it here and handle it in next_prompt/2 (and in
@@ -262,37 +163,106 @@ defmodule Go do
 
   The tool names come from `@tools`, so this list can't drift from what the
   API actually receives; how to use each tool lives in its own description.
-  The text depends only on `cwd`, so it is byte-identical for every request in
-  a session, which keeps it cacheable (see `request_body/2`).
+  The machine facts come from `machine/0`, which is detected once per
+  session. The text depends only on `cwd` and those facts, so it is
+  byte-identical for every request in a session, which keeps it cacheable
+  (see `request_body/2`).
   """
-  def system_prompt(cwd) do
+  def system_prompt(cwd, machine \\ machine()) do
     """
     You are a coding agent running inside "go", a small custom harness written in
     Elixir. It is not Claude Code. Your only tools are
     #{Enum.map_join(@tools, ", ", & &1.name)};
-    the harness runs them on the user's machine with the user's permissions.
+    the harness runs them on the user's machine with the user's permissions, and
+    nothing asks the user first.
 
     Working directory: #{cwd}
     Relative paths resolve against it; prefer them.
 
-    There is no shell tool. You cannot pipe, redirect, chain commands or run
-    arbitrary programs. To search a large web response, save it with Curl -o <file>
-    and Grep that file instead of reading it whole.
+    #{machine_text(machine)}
 
-    After changing Elixir code, run Mix compile and Mix test to verify it rather
-    than assuming it works.
+    Bash runs each command in a fresh, non-interactive shell in the working
+    directory: cd and variables don't carry over, stdin is empty, and there is
+    no editor or pager. Use Read, Edit and Write for files rather than cat, sed
+    or heredocs.
 
-    Git only runs these subcommands: #{Enum.join(@git_subcommands, ", ")}.
-    Its stash only allows #{Enum.join(@git_stash_actions, ", ")}. It cannot talk to a remote,
-    reset, rebase or amend commits. Use it freely to inspect and search history,
-    but only add, commit or stash when the user asks; check Git status and diff
-    first.
+    After changing Elixir code, run mix compile and mix test with Bash to verify
+    it rather than assuming it works.
 
-    If a tool you would need does not exist, say so instead of guessing. Changes
+    If a program you need isn't installed, say so instead of guessing. Changes
     to this harness's own code take effect only in the next session.
 
     Keep replies short and plain; the user reads them in a terminal.
     """
+  end
+
+  @doc """
+  What the system prompt says about the machine: the OS, the bash version,
+  and which of `@known_programs` are installed. Detected on the first call
+  and kept for the rest of the session, so the system prompt (and its cache
+  entry) doesn't change if the agent installs something.
+  """
+  def machine do
+    case :persistent_term.get({__MODULE__, :machine}, nil) do
+      nil ->
+        machine = detect_machine()
+        :persistent_term.put({__MODULE__, :machine}, machine)
+        machine
+
+      machine ->
+        machine
+    end
+  end
+
+  defp detect_machine do
+    {os, version} =
+      case :os.type() do
+        {:unix, :darwin} -> {"macOS", nil}
+        {:unix, :linux} -> {"Linux", :os.version() |> Tuple.to_list() |> Enum.join(".")}
+        {_, name} -> {to_string(name), nil}
+      end
+
+    {bash_version, _} = System.cmd("bash", ["-c", "echo -n ${BASH_VERSION%%(*}"])
+
+    %{
+      os: os,
+      os_version: version,
+      bash: bash_version,
+      programs: Enum.filter(@known_programs, &System.find_executable/1)
+    }
+  end
+
+  # The machine facts as prompt text, wrapped at 80 characters like the rest.
+  defp machine_text(machine) do
+    os = Enum.join(Enum.reject([machine.os, machine.os_version], &is_nil/1), " ")
+
+    macos =
+      if machine.os == "macOS",
+        do:
+          " sed, grep, find and date are the BSD versions (sed -i needs an argument, " <>
+            "grep has no -P) and there is no timeout command.",
+        else: ""
+
+    wrap(
+      "Machine: #{os}, bash #{machine.bash}." <>
+        macos <> " Installed: #{Enum.join(machine.programs, ", ")}."
+    )
+  end
+
+  defp wrap(text, width \\ 80) do
+    text
+    |> String.split(" ")
+    |> Enum.reduce([], fn
+      word, [] ->
+        [word]
+
+      word, [line | rest] ->
+        if String.length(line) + 1 + String.length(word) <= width,
+          do: [line <> " " <> word | rest],
+          else: [word, line | rest]
+    end)
+    |> Enum.reverse()
+    |> Enum.join("\n")
   end
 
   @doc """
@@ -937,161 +907,84 @@ defmodule Go do
     {"HTTP #{r.status}\n\n" <> truncate(to_string(r.body)), false}
   end
 
-  def execute_tool("Curl", %{"args" => args}) when is_list(args) do
-    # Args go straight to the curl binary (no shell), so nothing the model
-    # passes can be interpreted as a pipe, redirect or second command.
-    # Our defaults come first so the model's own flags win if repeated;
-    # --write-out is last so the status line is always ours.
-    {out, exit_code} =
-      System.cmd(
-        "curl",
-        ["--silent", "--show-error", "--max-time", "60"] ++
-          args ++ ["--write-out", "\n[curl] HTTP %{http_code}"],
-        stderr_to_stdout: true
-      )
+  def execute_tool("Bash", %{"command" => command} = input) do
+    timeout = (input["timeout"] || @bash_timeout) |> max(1) |> min(@bash_max_timeout)
+    {out, status} = run_bash(command, timeout)
+    # Binary output would make the request invalid JSON, so bad bytes become �.
+    output = out |> String.replace_invalid() |> String.trim_trailing() |> truncate()
 
-    # Peel off the trailing status line we appended (anchored to the end, so
-    # a response body that happens to contain "[curl] HTTP" can't fool it).
-    {body, status_line} =
-      case Regex.run(~r/\A(.*)\n\[curl\] (HTTP \d{3})\z/s, out) do
-        [_, body, status] -> {body, status}
-        nil -> {out, "HTTP ???"}
-      end
-
-    output = truncate(body) <> "\n\n" <> status_line <> " (exit #{exit_code})"
-    {output, exit_code != 0}
-  end
-
-  def execute_tool("Grep", %{"pattern" => pattern, "path" => path} = input) do
-    regex = Regex.compile!(pattern, if(input["case_insensitive"], do: "iu", else: "u"))
-    only_matching? = input["only_matching"] == true
-    max = input["max_results"] || 100
-
-    files =
-      cond do
-        File.regular?(path) -> [path]
-        File.dir?(path) -> files_under(path)
-        true -> raise "No such file or directory: #{path}"
-      end
-
-    # Lazily walk file -> line -> match so we stop reading once we hit max.
-    results =
-      files
-      |> Stream.flat_map(fn file ->
-        text = File.read!(file)
-        # Skip binaries (invalid UTF-8 would also make the "u" regex raise).
-        if String.valid?(text), do: grep_lines(file, text, regex, only_matching?), else: []
-      end)
-      |> Enum.take(max + 1)
-
-    output =
-      case results do
-        [] -> "No matches"
-        _ -> Enum.take(results, max) |> Enum.join("\n") |> truncate()
-      end
-
-    note = if length(results) > max, do: "\n\n(stopped at max_results=#{max})", else: ""
-    {output <> note, false}
-  end
-
-  def execute_tool("Mix", %{"task" => task}) when task not in @mix_tasks do
-    allowed = Enum.join(@mix_tasks, ", ")
-    {"Mix task not allowed: #{inspect(task)} (allowed: #{allowed})", true}
-  end
-
-  def execute_tool("Mix", %{"task" => task}) do
-    # Task name goes straight to the mix binary as one argv element (no shell).
-    {out, exit_code} = System.cmd("mix", [task], stderr_to_stdout: true)
-    output = truncate(out) <> "\n\n(exit #{exit_code})"
-    {output, exit_code != 0}
-  end
-
-  def execute_tool("Git", %{"subcommand" => subcommand, "args" => args}) when is_list(args) do
-    case git_refusal(subcommand, args) do
-      nil ->
-        # No shell, and the subcommand is always the first argument, so the
-        # model can't add git's global options (-c, --git-dir) in front of it.
-        # GIT_EDITOR=true makes anything that would open an editor carry on
-        # (or fail) instead of waiting forever; the pager is turned off too.
-        {out, exit_code} =
-          System.cmd("git", [subcommand | args],
-            stderr_to_stdout: true,
-            env: [{"GIT_EDITOR", "true"}, {"GIT_PAGER", "cat"}, {"GIT_TERMINAL_PROMPT", "0"}]
-          )
-
-        {truncate(out) <> "\n\n(exit #{exit_code})", exit_code != 0}
-
-      reason ->
-        {"Git refused: #{reason}", true}
+    case status do
+      :timeout -> {output <> "\n\n(killed after #{timeout} seconds)", true}
+      code -> {output <> "\n\n(exit #{code})", code != 0}
     end
   end
 
   def execute_tool(name, _input), do: {"Unknown tool: #{name}", true}
 
-  @doc """
-  Why the Git tool won't run `git <subcommand> <args>`, or `nil` if it will.
+  # Runs `bash -c command` in a Port so it can be killed at the deadline
+  # (System.cmd has no timeout, and macOS has no `timeout` command). The
+  # first line of the script points stdin at /dev/null, so a command that
+  # reads input gets EOF instead of waiting forever.
+  defp run_bash(command, timeout) do
+    port =
+      Port.open({:spawn_executable, System.find_executable("bash")}, [
+        :binary,
+        :exit_status,
+        :stderr_to_stdout,
+        :hide,
+        args: ["-c", "exec </dev/null\n" <> command],
+        env: for({k, v} <- @bash_env, do: {String.to_charlist(k), String.to_charlist(v)})
+      ])
 
-  Checks the subcommand against `@git_subcommands`, `git stash`'s action
-  against `@git_stash_actions`, and every flag against `@git_blocked_flags`.
-  Bundled short flags count separately (`-fA` contains `-f`), a long flag
-  matches with or without `=value`, and nothing after `--` is checked,
-  because git treats it as a path.
-  """
-  def git_refusal(subcommand, _args) when subcommand not in @git_subcommands,
-    do:
-      "subcommand #{inspect(subcommand)} is not allowed (allowed: #{Enum.join(@git_subcommands, ", ")})"
-
-  def git_refusal("stash", [action | _]) when action not in @git_stash_actions,
-    do:
-      if(String.starts_with?(action, "-"),
-        do: git_refused_flag("stash", ["push", action]),
-        else:
-          "git stash #{action} is not allowed (allowed: #{Enum.join(@git_stash_actions, ", ")})"
-      )
-
-  def git_refusal(subcommand, args), do: git_refused_flag(subcommand, args)
-
-  defp git_refused_flag(subcommand, args) do
-    blocked = Map.get(@git_blocked_flags, subcommand, []) ++ @git_blocked_flags[:all]
-    flags = args |> Enum.take_while(&(&1 != "--")) |> Enum.flat_map(&flag_names/1)
-
-    Enum.find_value(blocked, fn {flag, reason} ->
-      if flag in flags, do: "git #{subcommand} #{flag} is not allowed: it #{reason}"
-    end)
+    deadline = System.monotonic_time(:millisecond) + timeout * 1000
+    collect_output(port, deadline, "")
   end
 
-  # The flag names in one argument: "--output=x" -> ["--output"],
-  # "-fA" -> ["-f", "-A"], anything that isn't a flag -> [].
-  defp flag_names("--" <> _ = arg), do: [arg |> String.split("=", parts: 2) |> hd()]
+  defp collect_output(port, deadline, acc) do
+    wait = max(deadline - System.monotonic_time(:millisecond), 0)
 
-  defp flag_names("-" <> letters) do
-    if letters =~ ~r/\A[a-zA-Z]+\z/, do: for(<<c <- letters>>, do: "-" <> <<c>>), else: []
+    receive do
+      {^port, {:data, data}} ->
+        acc = if byte_size(acc) < @bash_max_bytes, do: acc <> data, else: acc
+        collect_output(port, deadline, acc)
+
+      {^port, {:exit_status, code}} ->
+        {acc, code}
+    after
+      wait ->
+        kill_port(port)
+        {acc, :timeout}
+    end
   end
 
-  defp flag_names(_), do: []
+  # Kills the shell and the processes it started (its direct children; a
+  # grandchild that detached itself can outlive it).
+  defp kill_port(port) do
+    case Port.info(port, :os_pid) do
+      {:os_pid, pid} ->
+        System.cmd("pkill", ["-KILL", "-P", to_string(pid)], stderr_to_stdout: true)
+        System.cmd("kill", ["-KILL", to_string(pid)], stderr_to_stdout: true)
 
-  # Emits "file:line:text" per matching line, or one entry per match with -o.
-  defp grep_lines(file, text, regex, only_matching?) do
-    text
-    |> String.split("\n")
-    |> Stream.with_index(1)
-    |> Stream.flat_map(fn {line, n} ->
-      cond do
-        only_matching? -> for [m | _] <- Regex.scan(regex, line), do: "#{file}:#{n}:#{m}"
-        Regex.match?(regex, line) -> ["#{file}:#{n}:#{String.slice(line, 0, 500)}"]
-        true -> []
-      end
-    end)
+      nil ->
+        :ok
+    end
+
+    try do
+      Port.close(port)
+    rescue
+      ArgumentError -> :ok
+    end
+
+    flush(port)
   end
 
-  # Every regular file under dir, skipping @grep_skip_dirs (and, because
-  # Path.wildcard ignores dotfiles, .git and other hidden folders).
-  defp files_under(dir) do
-    Path.wildcard(Path.join(dir, "**/*"))
-    |> Enum.reject(fn file ->
-      file |> Path.relative_to(dir) |> Path.split() |> Enum.any?(&(&1 in @grep_skip_dirs))
-    end)
-    |> Enum.filter(&File.regular?/1)
+  # Drops anything the port sent before it closed.
+  defp flush(port) do
+    receive do
+      {^port, _} -> flush(port)
+    after
+      0 -> :ok
+    end
   end
 
   @doc """
@@ -1106,7 +999,7 @@ defmodule Go do
     else
       String.slice(text, 0, @max_output) <>
         "\n\n(truncated: showing the first #{@max_output} of #{length} characters; " <>
-        "use Grep to find the part you need)"
+        "use grep -n and sed -n with Bash to see the part you need)"
     end
   end
 end
