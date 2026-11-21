@@ -828,10 +828,18 @@ defmodule Go do
 
   @doc """
   One-line summary of a tool result for the terminal: ok/error, its size, and
-  the start of its first line. The model always gets the full result.
+  the start of its first line. Control characters (escape codes, NULs,
+  carriage returns from a binary file or a progress bar) are dropped so they
+  can't garble the terminal. The model always gets the full result.
   """
   def result_summary(output, error?) do
-    first_line = output |> String.split("\n", parts: 2) |> hd() |> String.slice(0, 100)
+    first_line =
+      output
+      |> String.split("\n", parts: 2)
+      |> hd()
+      |> String.replace(~r/[[:cntrl:]]/u, "")
+      |> String.slice(0, 100)
+
     "#{if error?, do: "error", else: "ok"}, #{String.length(output)} chars: #{first_line}"
   end
 

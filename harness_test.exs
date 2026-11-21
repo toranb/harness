@@ -329,6 +329,11 @@ defmodule GoTest do
       assert Go.result_summary("line one\nline two", false) == "ok, 17 chars: line one"
       assert Go.result_summary("boom", true) == "error, 4 chars: boom"
     end
+
+    test "result summary drops control characters so they can't garble the terminal" do
+      assert Go.result_summary("\e[31mred\e[0m\0\r\tok\u0085\nnext", false) ==
+               "ok, 23 chars: [31mred[0mok"
+    end
   end
 
   describe "input and slash commands" do
