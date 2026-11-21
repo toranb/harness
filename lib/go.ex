@@ -64,15 +64,16 @@ defmodule Go do
   ]
 
   @doc """
-  Runs the agent on a prompt until the model stops asking for tools.
-  Returns the final assistant text.
+  Interactive agent session. Starts from a prompt, runs tools until the
+  model finishes its turn, then waits at a `>` prompt for the next message.
+  The conversation keeps its history across prompts.
+  Type `exit` or press Ctrl-D to quit.
   """
-  def run(prompt) when is_binary(prompt) do
-    {:ok, _} = Application.ensure_all_started(:req)
-    run([%{role: "user", content: prompt}])
-  end
+  def run(prompt) when is_binary(prompt), do: run([%{role: "user", content: prompt}])
 
   def run(messages) when is_list(messages) do
+    {:ok, _} = Application.ensure_all_started(:req)
+
     resp =
       Req.post!("https://api.anthropic.com/v1/messages",
         headers: [
@@ -143,7 +144,14 @@ defmodule Go do
         run(messages ++ [%{role: "user", content: results}])
 
       "end_turn" ->
-        for(%{"type" => "text", "text" => t} <- content, do: t) |> Enum.join("\n")
+        # Turn is done: wait for the next prompt (skipping blank lines).
+        input =
+          Stream.repeatedly(fn -> IO.gets("\n> ") end)
+          |> Enum.find(&(not is_binary(&1) or String.trim(&1) != ""))
+
+        if is_binary(input) and String.trim(input) not in ["exit", "quit"],
+          do: run(messages ++ [%{role: "user", content: String.trim(input)}]),
+          else: :ok
 
       other ->
         raise "Agent stopped with stop_reason=#{other}"
