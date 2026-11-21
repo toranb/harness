@@ -89,7 +89,13 @@ defmodule Go do
           "installed program. Each call is a fresh, non-interactive shell: cd and exported " <>
           "variables don't carry over, stdin is empty, and there is no editor or pager " <>
           "(pass -m to git commit). A command still running after `timeout` seconds " <>
-          "(default 120, max 600) is killed, so start servers in the background.",
+          "(default 120, max 600) is killed. To leave something running, such as a server " <>
+          "or a worker, start it in the background with its output redirected, e.g. " <>
+          "`nohup cmd > app.log 2>&1 & echo $! > app.pid`, then read the log with tail " <>
+          "and stop it with kill \"$(cat app.pid)\". Don't find it with pkill -f or pgrep -f: " <>
+          "they match any command line containing the words, including the harness's own. " <>
+          "Output from a background job that isn't redirected is cut off when your " <>
+          "command finishes.",
       input_schema: %{
         type: "object",
         properties: %{
@@ -134,13 +140,20 @@ defmodule Go do
     {"VISUAL", "true"},
     {"GIT_PAGER", "cat"},
     {"PAGER", "cat"},
-    {"GIT_TERMINAL_PROMPT", "0"}
+    {"GIT_TERMINAL_PROMPT", "0"},
+    {"LANG", "C.UTF-8"},
+    {"LC_ALL", "C.UTF-8"}
   ]
+
+  # Removed from every Bash command's environment: the harness's own API key.
+  # Without this, any command the model runs (or a script in the project it
+  # runs) could read the key from its environment and send it anywhere.
+  @bash_unset_env ~w(API_KEY ANTHROPIC_API_KEY)
 
   # Programs the system prompt reports as installed (when they are), so the
   # model doesn't have to guess what the machine has.
-  @known_programs ~w(git curl rg grep sed awk find jq make mix elixir erl node npm
-                     python3 docker gh)
+  @known_programs ~w(git curl wget rg grep sed awk find cat less head tail wc diff tar
+                     jq make mix elixir erl node npm python3 perl docker gh)
 
   # What you can type at the > prompt besides a message, as shown by /help.
   # To add a command, add it here and handle it in next_prompt/2 (and in
@@ -183,8 +196,8 @@ defmodule Go do
 
     Bash runs each command in a fresh, non-interactive shell in the working
     directory: cd and variables don't carry over, stdin is empty, and there is
-    no editor or pager. Use Read, Edit and Write for files rather than cat, sed
-    or heredocs.
+    no editor or pager. Prefer Read, Edit and Write for reading and changing
+    files; cat, sed, head, tail and grep are fine in Bash for quick looks.
 
     After changing Elixir code, run mix compile and mix test with Bash to verify
     it rather than assuming it works.
@@ -923,31 +936,58 @@ defmodule Go do
 
   # Runs `bash -c command` in a Port so it can be killed at the deadline
   # (System.cmd has no timeout, and macOS has no `timeout` command). The
-  # first line of the script points stdin at /dev/null, so a command that
-  # reads input gets EOF instead of waiting forever.
+  # script starts with two lines of its own:
+  #
+  #   exec </dev/null   stdin is empty, so a command that reads input gets
+  #                     EOF instead of waiting forever
+  #   trap ... EXIT     prints a random marker and the exit code as bash
+  #                     exits, even after `exit 3`
+  #
+  # The marker is how we know the command finished. The port only reports
+  # bash's exit once nothing holds its output pipe open, and a background
+  # job (`server &`) inherits that pipe, so without the marker the tool
+  # would wait for the job to end, or until the deadline.
   defp run_bash(command, timeout) do
+    marker = "__go_bash_done_" <> Base.encode16(:crypto.strong_rand_bytes(8), case: :lower)
+    script = "exec </dev/null\ntrap 'printf \"\\n#{marker} %d\\n\" $?' EXIT\n" <> command
+
+    env =
+      for({k, v} <- @bash_env, do: {String.to_charlist(k), String.to_charlist(v)}) ++
+        for(k <- @bash_unset_env, do: {String.to_charlist(k), false})
+
     port =
       Port.open({:spawn_executable, System.find_executable("bash")}, [
         :binary,
         :exit_status,
         :stderr_to_stdout,
         :hide,
-        args: ["-c", "exec </dev/null\n" <> command],
-        env: for({k, v} <- @bash_env, do: {String.to_charlist(k), String.to_charlist(v)})
+        args: ["-c", script],
+        env: env
       ])
 
     deadline = System.monotonic_time(:millisecond) + timeout * 1000
-    collect_output(port, deadline, "")
+    collect_output(port, deadline, marker, "")
   end
 
-  defp collect_output(port, deadline, acc) do
+  defp collect_output(port, deadline, marker, acc) do
     wait = max(deadline - System.monotonic_time(:millisecond), 0)
 
     receive do
       {^port, {:data, data}} ->
         acc = if byte_size(acc) < @bash_max_bytes, do: acc <> data, else: acc
-        collect_output(port, deadline, acc)
 
+        case split_marker(acc, marker) do
+          # bash has exited. Close our end of the pipe instead of waiting for
+          # background jobs to let go of it; they keep running.
+          {output, code} ->
+            close_port(port)
+            {output, code}
+
+          nil ->
+            collect_output(port, deadline, marker, acc)
+        end
+
+      # bash exited without printing the marker (its own EXIT trap replaced ours).
       {^port, {:exit_status, code}} ->
         {acc, code}
     after
@@ -957,18 +997,35 @@ defmodule Go do
     end
   end
 
+  # {output before the marker, exit code} once the marker line has arrived.
+  # Anything a background job printed after it is dropped.
+  defp split_marker(acc, marker) do
+    case Regex.run(~r/\A(.*)\n#{marker} (\d+)\n/s, acc) do
+      [_, output, code] -> {output, String.to_integer(code)}
+      nil -> nil
+    end
+  end
+
   # Kills the shell and the processes it started (its direct children; a
   # grandchild that detached itself can outlive it).
   defp kill_port(port) do
     case Port.info(port, :os_pid) do
       {:os_pid, pid} ->
-        System.cmd("pkill", ["-KILL", "-P", to_string(pid)], stderr_to_stdout: true)
+        # pkill comes from procps, which minimal Linux images may lack.
+        if System.find_executable("pkill"),
+          do: System.cmd("pkill", ["-KILL", "-P", to_string(pid)], stderr_to_stdout: true)
+
         System.cmd("kill", ["-KILL", to_string(pid)], stderr_to_stdout: true)
 
       nil ->
         :ok
     end
 
+    close_port(port)
+  end
+
+  # Closes the port if it is still open and drops anything it already sent.
+  defp close_port(port) do
     try do
       Port.close(port)
     rescue

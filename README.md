@@ -65,7 +65,7 @@ the function names below.
 | **3. Streaming** | `new_stream/0`, `consume_chunk/2`, `apply_event/2`, `finish_stream/1` | Rebuilding a complete response from server-sent events, so text prints while it's written and the rest of the loop never knows it was streamed | "Streaming" banner | [Streaming](#streaming) |
 | **4. Compaction** | `compact/3`, `compaction_prompt/1`, `extract_summary/1`, `compacted_messages/2` | Context is finite. `/compact` swaps the whole conversation for a summary that the model writes. | "Compaction" banner | [Compaction](#compaction-compact) |
 | **5. Tools** | `@tools`, `execute_tool/2` | A tool has two halves: a JSON schema that tells the model what it may ask for, and an Elixir clause that does the work and returns `{output, is_error}` | `@tools` near the top; `execute_tool/2` under the "Tools" banner | [Tools](#tools), [How to add a tool](#how-to-add-a-tool) |
-| **6. The Bash tool** | `@bash_env`, `run_bash/2`, `collect_output/3`, `kill_port/1` | Running a real shell without letting it hang the session: empty stdin, no editor or pager, a deadline, and a kill | Attributes above `system_prompt/2`; functions after `execute_tool/2` | [The Bash tool](#the-bash-tool) |
+| **6. The Bash tool** | `@bash_env`, `@bash_unset_env`, `run_bash/2`, `collect_output/4`, `split_marker/2`, `kill_port/1` | Running a real shell without letting it hang the session: empty stdin, no editor or pager, a deadline, and a kill | Attributes above `system_prompt/2`; functions after `execute_tool/2` | [The Bash tool](#the-bash-tool) |
 
 Supporting pieces:
 
@@ -336,14 +336,32 @@ to:
   that reads input (`cat`, a `[y/N]` prompt) gets end-of-file and moves on.
 - **No editor, pager or password prompt.** `GIT_EDITOR`, `EDITOR` and
   `VISUAL` are set to `true`, `PAGER` and `GIT_PAGER` to `cat`, and
-  `GIT_TERMINAL_PROMPT` to `0`. So `git commit` without `-m` fails instead of
-  waiting for an editor, and `git log` prints instead of opening `less`.
+  `GIT_TERMINAL_PROMPT` to `0`. So `git commit` without `-m` fails instead
+  of waiting for an editor, and `git log` prints instead of opening `less`.
+  `LANG` and `LC_ALL` are set to `C.UTF-8`, so tools print UTF-8 the same
+  way on every machine that has that locale.
 - **A deadline.** `run_bash/2` runs bash in an Erlang Port instead of
   `System.cmd`, which has no timeout (and macOS has no `timeout` command).
   If the command is still running at the deadline, `kill_port/1` kills the
   shell and the processes it started, and the result ends with
   `(killed after N seconds)` and is an error. The model can pass a longer
-  `timeout` for slow builds, or start a server in the background with `&`.
+  `timeout` for slow builds.
+- **Done means done, even with a background job.** A server or worker
+  started with `&` inherits the shell's output pipe, and Erlang only reports
+  that a program exited once nothing holds that pipe open. So `server &`
+  used to make the tool wait until the deadline and then report the command
+  as killed. Now the script's first lines set an `EXIT` trap that prints a
+  random marker and the exit code as bash exits (even after `exit 3`).
+  `collect_output/4` returns as soon as it sees the marker, and the
+  background job keeps running. The tool description tells the model to
+  redirect a background job's output to a log file, save its PID with `$!`,
+  read the log with `tail`, and stop it with `kill` on that PID, not
+  `pkill -f`. A prompt given on the command line is part of the harness's
+  own command line, so `pkill -f server` can kill the harness itself.
+- **The harness's API key isn't passed on.** `API_KEY` and
+  `ANTHROPIC_API_KEY` are removed from every command's environment
+  (`@bash_unset_env`), so a command can't read the key the harness itself
+  uses and send it somewhere.
 - **Bounded output.** At most 1 MB of output is kept while the command runs,
   so `yes` can't fill memory before the deadline. Bytes that aren't valid
   UTF-8 become `�`, because the result goes back to the API as JSON.
@@ -599,7 +617,9 @@ There isn't any, on purpose. This agent is all gas and no brakes.
   confirmation step. The only guidance is the system prompt, and the model
   can ignore it.
 - **The network is open.** Bash, curl and WebFetch can send anything the
-  model reads, including `.env`, to any URL.
+  model reads, including `.env`, to any URL. The one thing kept back is the
+  harness's own API key, which is removed from Bash's environment; a `.env`
+  file on disk is still readable.
 - **AGENTS.md is followed as your instructions,** and so, in practice, is
   anything the model reads that tells it what to do: a web page, a README,
   a code comment. Only point it at projects and content you trust.
@@ -622,8 +642,11 @@ slash command parsing, the compaction steps (everything except the API
 call), the status line, and the streaming parser.
 
 The Bash tests run real commands. They check pipes and exit codes, stderr,
-the working directory, empty stdin, the timeout kill, invalid UTF-8, and
-that `git commit` fails instead of waiting for an editor. The streaming
+the working directory, empty stdin, the timeout kill, invalid UTF-8, that
+`git commit` fails instead of waiting for an editor, that a command returns
+at once while a background job keeps running, that `exit` codes come through
+(also when a script sets its own `EXIT` trap), and that the API key is not in
+a command's environment. The streaming
 tests feed in a sample event stream, both whole and split into chunks as
 small as one byte, and check that every split gives the same reply.
 

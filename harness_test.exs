@@ -61,6 +61,48 @@ defmodule GoTest do
     end
 
     @tag :tmp_dir
+    test "returns as soon as the command ends, leaving a background job running",
+         %{tmp_dir: dir} do
+      File.cd!(dir, fn ->
+        started = System.monotonic_time(:millisecond)
+
+        # The background job holds the output pipe for 3 seconds; the command
+        # itself is done at once.
+        {output, false} =
+          Go.execute_tool("Bash", %{
+            "command" =>
+              "(sleep 3; echo late) & echo now; (sleep 1; echo done > bg.txt) > /dev/null 2>&1 &",
+            "timeout" => 10
+          })
+
+        assert System.monotonic_time(:millisecond) - started < 2_000
+        assert output == "now\n\n(exit 0)"
+
+        Process.sleep(1_500)
+        assert File.read!("bg.txt") == "done\n"
+      end)
+    end
+
+    test "reports the exit code from exit, and from a script whose own EXIT trap replaces ours" do
+      assert {"bye\n\n(exit 4)", true} =
+               Go.execute_tool("Bash", %{"command" => "echo bye; exit 4"})
+
+      assert {"mine\n\n(exit 5)", true} =
+               Go.execute_tool("Bash", %{"command" => "trap 'echo mine' EXIT; exit 5"})
+    end
+
+    test "the harness's API key is not in a command's environment" do
+      System.put_env("API_KEY", "secret-for-test")
+
+      try do
+        assert {"unset\n\n(exit 0)", false} =
+                 Go.execute_tool("Bash", %{"command" => "echo ${API_KEY-unset}"})
+      after
+        System.delete_env("API_KEY")
+      end
+    end
+
+    @tag :tmp_dir
     test "git never waits for an editor", %{tmp_dir: dir} do
       File.cd!(dir, fn ->
         {_, 0} = System.cmd("git", ["init", "-q"])
