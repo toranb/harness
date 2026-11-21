@@ -1,7 +1,7 @@
 defmodule Go do
   @moduledoc """
-  A bare-bones agent loop over the Claude Messages API with three
-  client-side tools that mirror Claude Code's: Read, Write, Edit, WebFetch,
+  A bare-bones agent loop over the Claude Messages API with
+  client-side tools that mirror Claude Code's: Read, Write, Edit, WebFetch, Grep,
   plus Curl, which shells out to the native `curl` binary.
   """
 
@@ -72,7 +72,8 @@ defmodule Go do
           "request body. Pass each argument as its own array element exactly as the shell " <>
           "would after removing quotes and line continuations, e.g. " <>
           ~s|["https://example.com", "-H", "accept: text/html", "-b", "a=1; b=2"]. | <>
-          "No shell is involved, so pipes, redirects and variables do not work.",
+          "No shell is involved, so pipes, redirects and variables do not work: to search a " <>
+          "large response, save it with -o <file> and then use Grep on that file.",
       input_schema: %{
         type: "object",
         properties: %{
@@ -83,6 +84,33 @@ defmodule Go do
           }
         },
         required: ["args"],
+        additionalProperties: false
+      },
+      strict: true
+    },
+    %{
+      name: "Grep",
+      description:
+        "Search a file, or every file under a directory, for a regular expression " <>
+          "(PCRE syntax, matched line by line) and return matches as file:line:text. " <>
+          "Like `grep -n`; set only_matching to return just the matched text (`grep -o`). " <>
+          "Use it to pull specific pieces out of large files, such as a page saved with Curl -o.",
+      input_schema: %{
+        type: "object",
+        properties: %{
+          pattern: %{type: "string", description: "Regular expression, e.g. <h[12][^>]*>[^<]*"},
+          path: %{type: "string", description: "File or directory to search"},
+          only_matching: %{
+            type: "boolean",
+            description: "Return only the matched text, not the whole line (default false)"
+          },
+          case_insensitive: %{type: "boolean", description: "Ignore case (default false)"},
+          max_results: %{
+            type: "integer",
+            description: "Stop after this many results (default 100)"
+          }
+        },
+        required: ["pattern", "path"],
         additionalProperties: false
       },
       strict: true
@@ -222,5 +250,51 @@ defmodule Go do
     {output, exit_code != 0}
   end
 
+  def execute_tool("Grep", %{"pattern" => pattern, "path" => path} = input) do
+    regex = Regex.compile!(pattern, if(input["case_insensitive"], do: "iu", else: "u"))
+    only_matching? = input["only_matching"] == true
+    max = input["max_results"] || 100
+
+    files =
+      cond do
+        File.regular?(path) -> [path]
+        File.dir?(path) -> Path.wildcard(Path.join(path, "**/*")) |> Enum.filter(&File.regular?/1)
+        true -> raise "No such file or directory: #{path}"
+      end
+
+    # Lazily walk file -> line -> match so we stop reading once we hit max.
+    results =
+      files
+      |> Stream.flat_map(fn file ->
+        text = File.read!(file)
+        # Skip binaries (invalid UTF-8 would also make the "u" regex raise).
+        if String.valid?(text), do: grep_lines(file, text, regex, only_matching?), else: []
+      end)
+      |> Enum.take(max + 1)
+
+    output =
+      case results do
+        [] -> "No matches"
+        _ -> Enum.take(results, max) |> Enum.join("\n") |> String.slice(0, 50_000)
+      end
+
+    note = if length(results) > max, do: "\n\n(stopped at max_results=#{max})", else: ""
+    {output <> note, false}
+  end
+
   def execute_tool(name, _input), do: {"Unknown tool: #{name}", true}
+
+  # Emits "file:line:text" per matching line, or one entry per match with -o.
+  defp grep_lines(file, text, regex, only_matching?) do
+    text
+    |> String.split("\n")
+    |> Stream.with_index(1)
+    |> Stream.flat_map(fn {line, n} ->
+      cond do
+        only_matching? -> for [m | _] <- Regex.scan(regex, line), do: "#{file}:#{n}:#{m}"
+        Regex.match?(regex, line) -> ["#{file}:#{n}:#{String.slice(line, 0, 500)}"]
+        true -> []
+      end
+    end)
+  end
 end
