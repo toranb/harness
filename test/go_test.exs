@@ -61,4 +61,15 @@ defmodule GoTest do
       end
     end
   end
+
+  describe "Mix tool" do
+    test "rejects tasks outside the allowlist" do
+      for task <- ["run", "deps.clean", "test --eval System.halt", "", "archive.install"] do
+        {output, error?} = Go.execute_tool("Mix", %{"task" => task})
+
+        assert error?
+        assert output =~ "Mix task not allowed"
+      end
+    end
+  end
 end

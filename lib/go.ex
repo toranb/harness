@@ -5,6 +5,9 @@ defmodule Go do
   plus Curl, which shells out to the native `curl` binary.
   """
 
+  # The only mix tasks the Mix tool will run.
+  @mix_tasks ~w(deps.get compile test format)
+
   @tools [
     %{
       name: "Read",
@@ -111,6 +114,27 @@ defmodule Go do
           }
         },
         required: ["pattern", "path"],
+        additionalProperties: false
+      },
+      strict: true
+    },
+    %{
+      name: "Mix",
+      description:
+        "Run one allowlisted mix task in the project directory and return its output " <>
+          "(stdout and stderr, truncated to 50,000 characters) followed by the exit code. " <>
+          "A non-zero exit is reported as an error. Allowed tasks: " <>
+          Enum.join(@mix_tasks, ", ") <> ".",
+      input_schema: %{
+        type: "object",
+        properties: %{
+          task: %{
+            type: "string",
+            enum: @mix_tasks,
+            description: "The mix task to run, e.g. compile or test"
+          }
+        },
+        required: ["task"],
         additionalProperties: false
       },
       strict: true
@@ -280,6 +304,18 @@ defmodule Go do
 
     note = if length(results) > max, do: "\n\n(stopped at max_results=#{max})", else: ""
     {output <> note, false}
+  end
+
+  def execute_tool("Mix", %{"task" => task}) when task not in @mix_tasks do
+    allowed = Enum.join(@mix_tasks, ", ")
+    {"Mix task not allowed: #{inspect(task)} (allowed: #{allowed})", true}
+  end
+
+  def execute_tool("Mix", %{"task" => task}) do
+    # Task name goes straight to the mix binary as one argv element (no shell).
+    {out, exit_code} = System.cmd("mix", [task], stderr_to_stdout: true)
+    output = String.slice(out, 0, 50_000) <> "\n\n(exit #{exit_code})"
+    {output, exit_code != 0}
   end
 
   def execute_tool(name, _input), do: {"Unknown tool: #{name}", true}
