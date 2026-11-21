@@ -264,7 +264,7 @@ defmodule Go do
   @doc """
   Starts an interactive session. This is the whole agent loop:
 
-    1. send the conversation to the model (`call_model/1`)
+    1. send the conversation to the model (`call_model/2`, streamed)
     2. if the model asked for tools, run them (`run_tools/1`), append the
        results to the conversation and go back to 1
     3. otherwise its turn is over: read the user's next message
@@ -297,7 +297,8 @@ defmodule Go do
   defp loop(messages, turn) do
     case call_model(messages) do
       {:ok, response} ->
-        print_response(response, turn)
+        # The reply's text was already printed as it streamed in.
+        IO.puts(turn_status(turn, response["stop_reason"], response["usage"]))
         # Append the assistant's content unchanged (thinking blocks included).
         messages = messages ++ [%{role: "assistant", content: response["content"]}]
 
@@ -391,7 +392,7 @@ defmodule Go do
     request = messages ++ [%{role: "user", content: compaction_prompt(focus)}]
     IO.puts("[compact] summarizing #{length(messages)} messages...")
 
-    with {:ok, response} <- call_model(request),
+    with {:ok, response} <- call_model(request, show_text: false),
          IO.puts("[compact] " <> turn_status(turn, response["stop_reason"], response["usage"])),
          {:ok, summary} <- extract_summary(response) do
       IO.puts("\n--- summary (the model's only memory of the session from here on) ---")
@@ -474,14 +475,22 @@ defmodule Go do
   end
 
   @doc """
-  Sends the conversation to the Messages API.
+  Sends the conversation to the Messages API and streams the reply.
 
-  Returns `{:ok, response_body}` or `{:error, reason}`. Errors are returned
-  rather than raised, so a failed request doesn't end the session.
-  With `--debug`, prints the full request body first.
+  With `stream: true` the API sends the reply as server-sent events while it
+  is being generated, instead of one JSON body at the end. Text is printed
+  the moment it arrives (pass `show_text: false` to stay quiet), and the
+  events are put back together into the same response the non-streaming API
+  returns: `%{"content" => blocks, "stop_reason" => _, "usage" => _}`. The
+  rest of the loop never needs to know the reply was streamed.
+
+  Returns `{:ok, response}` or `{:error, reason}`. Errors are returned rather
+  than raised, so a failed request doesn't end the session. With `--debug`,
+  prints the full request body first.
   """
-  def call_model(messages) do
-    body = request_body(messages, File.cwd!())
+  def call_model(messages, opts \\ []) do
+    show_text? = Keyword.get(opts, :show_text, true)
+    body = messages |> request_body(File.cwd!()) |> Map.put(:stream, true)
 
     if Application.get_env(:go, :debug, false) do
       IO.inspect(body,
@@ -492,6 +501,23 @@ defmodule Go do
       )
     end
 
+    # Req calls this with each chunk of the response body as it arrives. The
+    # stream state (see new_stream/0) is kept in the response's private map.
+    on_chunk = fn {:data, chunk}, {req, resp} ->
+      resp =
+        if resp.status == 200 do
+          stream = Req.Response.get_private(resp, :stream, new_stream())
+          {stream, text} = consume_chunk(stream, chunk)
+          if show_text?, do: IO.write(text)
+          Req.Response.put_private(resp, :stream, stream)
+        else
+          # An error response is one plain JSON body, not events: keep it raw.
+          Req.Response.update_private(resp, :error_body, chunk, &(&1 <> chunk))
+        end
+
+      {:cont, {req, resp}}
+    end
+
     result =
       Req.post("https://api.anthropic.com/v1/messages",
         headers: [
@@ -499,20 +525,159 @@ defmodule Go do
           {"anthropic-version", "2026-10-21"}
         ],
         json: body,
-        receive_timeout: 600_000
+        receive_timeout: 600_000,
+        into: on_chunk
       )
 
     case result do
-      {:ok, %{status: 200, body: response}} -> {:ok, response}
-      {:ok, %{status: status, body: body}} -> {:error, "HTTP #{status}: #{inspect(body)}"}
-      {:error, exception} -> {:error, Exception.message(exception)}
+      {:ok, %{status: 200} = resp} ->
+        finish_stream(Req.Response.get_private(resp, :stream, new_stream()))
+
+      {:ok, resp} ->
+        {:error, "HTTP #{resp.status}: #{Req.Response.get_private(resp, :error_body, "")}"}
+
+      {:error, exception} ->
+        {:error, Exception.message(exception)}
     end
   end
 
-  # Prints the model's text, then one status line so you can watch the loop.
-  defp print_response(%{"content" => content} = response, turn) do
-    for %{"type" => "text", "text" => text} <- content, do: IO.puts(text)
-    IO.puts(turn_status(turn, response["stop_reason"], response["usage"]))
+  # ---------------------------------------------------------------------------
+  # Streaming: rebuilding a response from server-sent events
+  # ---------------------------------------------------------------------------
+  #
+  # A streamed reply arrives as events like these, one per blank-line-separated
+  # chunk of text (`event:` names the type, `data:` is JSON):
+  #
+  #   message_start        usage for the prompt (input and cache tokens)
+  #   content_block_start  a new block at `index`: text, tool_use or thinking
+  #   content_block_delta  a piece of that block: text_delta, input_json_delta,
+  #                        thinking_delta or signature_delta
+  #   content_block_stop   the block at `index` is complete
+  #   message_delta        the stop_reason and the output token count
+  #   message_stop         the end
+  #   ping / error         keep-alive / something went wrong mid-stream
+
+  @doc """
+  The state of a reply while it streams in:
+
+    * `buffer`: the start of an event cut off at the end of the last chunk
+    * `blocks`: each content block built so far, by its `index`
+    * `json`: each tool_use block's input, which arrives as pieces of a
+      JSON string and is only decoded once the block is complete
+    * `stop_reason`, `usage`, `error`: filled in by the events that carry them
+  """
+  def new_stream,
+    do: %{buffer: "", blocks: %{}, json: %{}, stop_reason: nil, usage: %{}, error: nil}
+
+  @doc """
+  Feeds one network chunk into the stream. A chunk can end in the middle of
+  an event, so only complete events (ending in a blank line) are applied and
+  the rest waits in `buffer` for the next chunk. Returns the new state and
+  the text to print.
+  """
+  def consume_chunk(stream, chunk) do
+    [rest | complete] = String.split(stream.buffer <> chunk, "\n\n") |> Enum.reverse()
+
+    complete
+    |> Enum.reverse()
+    |> Enum.reduce({%{stream | buffer: rest}, ""}, fn raw_event, {stream, printed} ->
+      {stream, text} = apply_event(stream, decode_event(raw_event))
+      {stream, printed <> text}
+    end)
+  end
+
+  # The JSON on an event's `data:` line (the `event:` line repeats its type).
+  defp decode_event(raw_event) do
+    case for("data: " <> json <- String.split(raw_event, "\n"), do: json) do
+      [] -> %{}
+      lines -> JSON.decode!(Enum.join(lines, "\n"))
+    end
+  end
+
+  @doc """
+  Applies one event to the stream state. Returns the new state and the text
+  to print: the text of a `text_delta`, and a newline when a text block ends.
+  Event and delta types it doesn't know about are ignored.
+  """
+  def apply_event(stream, %{"type" => "message_start", "message" => message}),
+    do: {%{stream | usage: message["usage"] || %{}}, ""}
+
+  def apply_event(stream, %{"type" => "content_block_start", "index" => i} = event),
+    do: {put_in(stream.blocks[i], event["content_block"]), ""}
+
+  def apply_event(stream, %{"type" => "content_block_delta", "index" => i, "delta" => delta}) do
+    case delta do
+      %{"type" => "text_delta", "text" => text} ->
+        {append_to_block(stream, i, "text", text), text}
+
+      %{"type" => "input_json_delta", "partial_json" => piece} ->
+        {%{stream | json: Map.update(stream.json, i, piece, &(&1 <> piece))}, ""}
+
+      %{"type" => "thinking_delta", "thinking" => piece} ->
+        {append_to_block(stream, i, "thinking", piece), ""}
+
+      %{"type" => "signature_delta", "signature" => piece} ->
+        {append_to_block(stream, i, "signature", piece), ""}
+
+      _ ->
+        {stream, ""}
+    end
+  end
+
+  def apply_event(stream, %{"type" => "content_block_stop", "index" => i}) do
+    case stream.blocks[i] do
+      # The input arrived as JSON text in pieces; decode it now it's complete.
+      # A tool called with no arguments sends no pieces at all.
+      %{"type" => "tool_use"} ->
+        input =
+          case Map.get(stream.json, i, "") do
+            "" -> %{}
+            json -> JSON.decode!(json)
+          end
+
+        {put_in(stream.blocks[i]["input"], input), ""}
+
+      %{"type" => "text"} ->
+        {stream, "\n"}
+
+      _ ->
+        {stream, ""}
+    end
+  end
+
+  def apply_event(stream, %{"type" => "message_delta"} = event) do
+    usage = for {key, value} <- event["usage"] || %{}, value != nil, into: %{}, do: {key, value}
+
+    {%{
+       stream
+       | stop_reason: event["delta"]["stop_reason"],
+         usage: Map.merge(stream.usage, usage)
+     }, ""}
+  end
+
+  def apply_event(stream, %{"type" => "error", "error" => error}),
+    do: {%{stream | error: error}, ""}
+
+  # ping, message_stop, and any event type added to the API later.
+  def apply_event(stream, _event), do: {stream, ""}
+
+  defp append_to_block(stream, i, key, piece),
+    do: update_in(stream.blocks[i][key], &((&1 || "") <> piece))
+
+  @doc """
+  Turns a finished stream into a response, ordering the blocks by index.
+  Returns an error if the API sent an error event, or if the stream ended
+  before `message_delta` delivered a stop_reason (a dropped connection).
+  """
+  def finish_stream(%{error: %{} = error}),
+    do: {:error, "stream error: #{error["type"]}: #{error["message"]}"}
+
+  def finish_stream(%{stop_reason: nil}),
+    do: {:error, "the stream ended before the reply was complete"}
+
+  def finish_stream(stream) do
+    content = stream.blocks |> Enum.sort_by(fn {i, _} -> i end) |> Enum.map(fn {_, b} -> b end)
+    {:ok, %{"content" => content, "stop_reason" => stream.stop_reason, "usage" => stream.usage}}
   end
 
   @doc """

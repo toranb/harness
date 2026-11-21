@@ -38,6 +38,7 @@ now waiting at `>` for your next message.
 - [What the model sees](#what-the-model-sees)
 - [Tools](#tools)
 - [Reading the output](#reading-the-output)
+- [Streaming](#streaming)
 - [Prompt caching](#prompt-caching)
 - [Compaction (/compact)](#compaction-compact)
 - [Safety](#safety)
@@ -90,8 +91,11 @@ end the session. The conversation is not saved after you exit.
 - **AGENTS.md support.** If the working directory has an `AGENTS.md`, it is
   put in front of your first message, so the project's rules apply for the
   whole session.
+- **Streaming.** Replies appear word by word as the model writes them,
+  instead of all at once at the end ([details](#streaming)).
 - **Manual compaction.** `/compact` replaces a long conversation with a
-  summary so the session can keep going. It only happens when you type it.
+  summary so the session can keep going. It only happens when you type it
+  ([details](#compaction-compact)).
 - **Prompt caching** on every request. The tools, the system prompt and the
   conversation so far are read from cache instead of being processed again.
 - **Errors don't end the session.** If a tool fails, the model gets the error
@@ -113,7 +117,7 @@ end the session. The conversation is not saved after you exit.
   messages = [user: AGENTS.md (if any) + your prompt]
         │
         ▼
- ┌─► call_model(messages) ── POST /v1/messages with tools + system + all messages
+ ┌─► call_model(messages) ── POST /v1/messages (streamed) with tools + system + all messages
  │      │
  │      ▼
  │   append the assistant's reply to messages
@@ -135,7 +139,7 @@ Step by step, using the function names in `harness.exs`:
    It builds the first user message with **`first_message/2`**, which adds
    `AGENTS.md` if there is one, and starts the loop.
 2. **`loop/2`** runs once per request to the model. It calls
-   **`call_model/1`**, which uses **`request_body/2`** to build the request.
+   **`call_model/2`**, which uses **`request_body/2`** to build the request.
    That is the model name, `max_tokens`, the system prompt, the seven tool
    definitions, and the *entire* conversation so far. The model has no memory
    between requests; the conversation in `messages` is its only memory, and
@@ -143,8 +147,10 @@ Step by step, using the function names in `harness.exs`:
 3. The response is a list of content blocks. **Text** blocks are what the
    model says to you. **`tool_use`** blocks are requests to run a tool, each
    with a tool name, an input that matches that tool's schema, and an id.
-   **Thinking** blocks are the model's own reasoning. The harness prints the
-   text and adds the whole reply, unchanged, to `messages`.
+   **Thinking** blocks are the model's own reasoning. The reply is streamed,
+   so the text is printed as it is generated, and the harness rebuilds the
+   complete list of blocks from the stream ([Streaming](#streaming)). It
+   adds the whole reply, unchanged, to `messages`.
 4. If the model asked for tools, **`run_tools/1`** runs each `tool_use`
    block in order through **`execute_tool/2`**. It collects one
    `tool_result` per call, with the same id and an `is_error` flag. All the
@@ -256,6 +262,63 @@ prompt picks up the new name automatically.
 - **`<-`** is the result: `ok` or `error`, its length, and the start of its
   first line. The model always receives the full result.
 
+## Streaming
+
+Every request sets `stream: true`. Instead of waiting for the whole reply and
+receiving one JSON body, the harness gets the reply as
+[server-sent events](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events)
+while the model is still writing it, and prints text as soon as it arrives.
+In a test, one reply reached the terminal in 72 separate pieces over about
+seven seconds.
+
+A streamed reply is a sequence of small events, each a line of JSON:
+
+```text
+message_start         prompt token counts (input and cache)
+content_block_start   index 0 is a thinking block
+content_block_delta   index 0: signature_delta
+content_block_stop    index 0 is complete
+content_block_start   index 1 is a text block
+content_block_delta   index 1: text_delta "Let me "     ← printed now
+content_block_delta   index 1: text_delta "look."       ← printed now
+content_block_stop    index 1 is complete               ← newline printed
+content_block_start   index 2 is a tool_use block (Read)
+content_block_delta   index 2: input_json_delta "{\"file_"
+content_block_delta   index 2: input_json_delta "path\": \"a.ex\"}"
+content_block_stop    index 2 is complete: decode the input JSON
+message_delta         stop_reason "tool_use", output token count
+message_stop
+```
+
+The harness rebuilds the same response the non-streaming API would have
+returned, so nothing else in the loop changes:
+
+- **`consume_chunk/2`** receives each piece of the HTTP body as Req reads it.
+  A network chunk can end partway through an event, so it applies only the
+  complete events (each ends with a blank line) and keeps the rest for the
+  next chunk.
+- **`apply_event/2`** updates the reply being built (**`new_stream/0`**).
+  Text and thinking pieces are appended to their block. A tool call's input
+  arrives as pieces of a JSON string and is decoded once its block ends.
+  `ping` events and event types it doesn't recognize are ignored.
+- **`finish_stream/1`** returns `{:ok, response}` with the blocks in index
+  order, the `stop_reason` and the token counts. If the API sent an `error`
+  event partway through, or the connection dropped before a `stop_reason`
+  arrived, it returns an error instead, and the usual retry prompt appears.
+
+Rebuilding the blocks exactly matters. Every block, including thinking blocks
+and their signatures, goes back to the API on the next request, and the API
+rejects a conversation whose earlier blocks were changed.
+
+`/compact` streams its summary request too, but doesn't print it as it
+arrives. It prints the finished summary once, between clear markers.
+
+The API also offers `eager_input_streaming` for tools, which sends a tool
+call's input before the API has checked it against the schema. The harness
+leaves it off: it only runs tools once the whole reply has arrived, so there
+is nothing to gain, and keeping it off keeps `strict: true`'s guarantee that
+tool inputs match their schemas.
+
 ## Prompt caching
 
 Every request repeats everything that came before it, so without caching the
@@ -354,8 +417,9 @@ This is a learning tool, not a sandbox.
 | `@max_output`, `@grep_skip_dirs` | The 50,000-character output limit and the folders Grep skips |
 | `system_prompt/1`, `first_message/2`, `request_body/2` | What goes into each request |
 | `run/1`, `start/1`, `loop/2`, `next_prompt/2`, `add_user_text/2` | The agent loop |
-| `call_model/1` | One HTTP request to the Messages API; returns `{:ok, _}` or `{:error, _}` |
-| `print_response/2`, `turn_status/3`, `run_tools/1`, `result_summary/2` | Running tools and printing what happens |
+| `call_model/2` | One streamed request to the Messages API; returns `{:ok, response}` or `{:error, reason}` |
+| `new_stream/0`, `consume_chunk/2`, `apply_event/2`, `finish_stream/1` | Rebuilding the response from the streamed events |
+| `turn_status/3`, `run_tools/1`, `result_summary/2` | Running tools and printing what happens |
 | `read_user_input/0`, `parse_input/1` | The `>` prompt: messages, `/commands` and `exit` |
 | `compact/3`, `compaction_prompt/1`, `extract_summary/1`, `compacted_messages/2` | `/compact` |
 | `execute_tool/2` | One clause per tool |
@@ -370,8 +434,10 @@ elixir harness_test.exs
 
 The tests load `harness.exs` without starting a session and check the tools,
 the system prompt, AGENTS.md loading, the cache settings, input and slash
-command parsing, the compaction steps (everything except the API call) and
-the status line. None of them call the API. The script exits with a non-zero
+command parsing, the compaction steps (everything except the API call), the
+status line, and the streaming parser. The parser tests feed in a sample
+event stream, both whole and split into chunks as small as one byte, and
+check that every split gives the same reply. None of them call the API. The script exits with a non-zero
 status if any test fails, so it works in CI or a git hook.
 
 ## Limitations
@@ -383,7 +449,8 @@ status if any test fails, so it works in CI or a git hook.
   tokens partway through a tool call, the harness treats it as the end of the
   turn, and the next request is likely to fail. The status line shows
   `stop_reason=max_tokens` when this happens.
-- **No streaming.** Each reply appears all at once when it's complete.
+- **Tool calls aren't shown while they stream.** Only text is printed as it
+  arrives; a tool call appears once its input is complete.
 - **Tools run one at a time,** even when the model asks for several at once.
 - **Read has no offset.** Large files are cut at 50,000 characters; use Grep
   to find the part you need.

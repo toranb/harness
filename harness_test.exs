@@ -282,4 +282,168 @@ defmodule GoTest do
       assert Go.turn_status(1, "end_turn", large) =~ "large context: /compact to shrink it"
     end
   end
+
+  describe "streaming" do
+    # Builds a server-sent-events body like the API's from a list of events.
+    defp sse(events) do
+      Enum.map_join(events, fn event ->
+        "event: #{event["type"]}\ndata: #{JSON.encode!(event)}\n\n"
+      end)
+    end
+
+    defp delta(i, delta), do: %{"type" => "content_block_delta", "index" => i, "delta" => delta}
+
+    @reply [
+      %{
+        "type" => "message_start",
+        "message" => %{"usage" => %{"input_tokens" => 4, "cache_read_input_tokens" => 2000}}
+      },
+      %{
+        "type" => "content_block_start",
+        "index" => 0,
+        "content_block" => %{"type" => "thinking", "thinking" => "", "signature" => ""}
+      },
+      %{
+        "type" => "content_block_delta",
+        "index" => 0,
+        "delta" => %{"type" => "signature_delta", "signature" => "sig123"}
+      },
+      %{"type" => "content_block_stop", "index" => 0},
+      %{"type" => "ping"},
+      %{
+        "type" => "content_block_start",
+        "index" => 1,
+        "content_block" => %{"type" => "text", "text" => ""}
+      },
+      %{
+        "type" => "content_block_delta",
+        "index" => 1,
+        "delta" => %{"type" => "text_delta", "text" => "Let me "}
+      },
+      %{
+        "type" => "content_block_delta",
+        "index" => 1,
+        "delta" => %{"type" => "text_delta", "text" => "look."}
+      },
+      %{"type" => "content_block_stop", "index" => 1},
+      %{
+        "type" => "content_block_start",
+        "index" => 2,
+        "content_block" => %{
+          "type" => "tool_use",
+          "id" => "tu_1",
+          "name" => "Read",
+          "input" => %{}
+        }
+      },
+      %{
+        "type" => "content_block_delta",
+        "index" => 2,
+        "delta" => %{"type" => "input_json_delta", "partial_json" => "{\"file_"}
+      },
+      %{
+        "type" => "content_block_delta",
+        "index" => 2,
+        "delta" => %{"type" => "input_json_delta", "partial_json" => "path\": \"a.ex\"}"}
+      },
+      %{"type" => "content_block_stop", "index" => 2},
+      %{
+        "type" => "message_delta",
+        "delta" => %{"stop_reason" => "tool_use"},
+        "usage" => %{"output_tokens" => 42}
+      },
+      %{"type" => "message_stop"}
+    ]
+
+    defp run_stream(body, chunk_size) do
+      chunks = for <<chunk::binary-size(chunk_size) <- body>>, do: chunk
+      tail = binary_part(body, length(chunks) * chunk_size, rem(byte_size(body), chunk_size))
+
+      {stream, printed} =
+        Enum.reduce(chunks ++ [tail], {Go.new_stream(), ""}, fn chunk, {stream, printed} ->
+          {stream, text} = Go.consume_chunk(stream, chunk)
+          {stream, printed <> text}
+        end)
+
+      {Go.finish_stream(stream), printed}
+    end
+
+    test "rebuilds the full response and prints only the text" do
+      {{:ok, response}, printed} = run_stream(sse(@reply), byte_size(sse(@reply)))
+
+      assert printed == "Let me look.\n"
+      assert response["stop_reason"] == "tool_use"
+
+      assert response["usage"] == %{
+               "input_tokens" => 4,
+               "cache_read_input_tokens" => 2000,
+               "output_tokens" => 42
+             }
+
+      assert response["content"] == [
+               %{"type" => "thinking", "thinking" => "", "signature" => "sig123"},
+               %{"type" => "text", "text" => "Let me look."},
+               %{
+                 "type" => "tool_use",
+                 "id" => "tu_1",
+                 "name" => "Read",
+                 "input" => %{"file_path" => "a.ex"}
+               }
+             ]
+    end
+
+    test "events split across network chunks give the same result" do
+      whole = run_stream(sse(@reply), byte_size(sse(@reply)))
+
+      for size <- [1, 7, 64] do
+        assert run_stream(sse(@reply), size) == whole
+      end
+    end
+
+    test "a tool called with no arguments gets an empty input" do
+      events = [
+        %{"type" => "message_start", "message" => %{"usage" => %{}}},
+        %{
+          "type" => "content_block_start",
+          "index" => 0,
+          "content_block" => %{"type" => "tool_use", "id" => "t", "name" => "X", "input" => %{}}
+        },
+        %{"type" => "content_block_stop", "index" => 0},
+        %{
+          "type" => "message_delta",
+          "delta" => %{"stop_reason" => "tool_use"},
+          "usage" => %{"output_tokens" => 3}
+        }
+      ]
+
+      {{:ok, response}, ""} = run_stream(sse(events), 1000)
+      assert [%{"input" => %{}}] = response["content"]
+    end
+
+    test "an error event or a cut-off stream is an error, not a reply" do
+      error = [
+        %{
+          "type" => "error",
+          "error" => %{"type" => "overloaded_error", "message" => "Overloaded"}
+        }
+      ]
+
+      assert {{:error, "stream error: overloaded_error: Overloaded"}, ""} =
+               run_stream(sse(error), 1000)
+
+      # Cut off mid text block: the text printed so far, then an error.
+      cut_off = Enum.take(@reply, 8)
+
+      assert {{:error, "the stream ended before the reply was complete"}, "Let me look."} =
+               run_stream(sse(cut_off), 1000)
+    end
+
+    test "unknown event and delta types are ignored" do
+      events =
+        List.insert_at(@reply, 7, %{"type" => "some_future_event"})
+        |> List.insert_at(7, delta(1, %{"type" => "citations_delta", "citation" => %{}}))
+
+      assert run_stream(sse(events), 1000) == run_stream(sse(@reply), 1000)
+    end
+  end
 end
