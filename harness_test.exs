@@ -88,7 +88,7 @@ defmodule GoTest do
 
       assert prompt =~ "Working directory: /some/project"
       names = Enum.map_join(Go.tools(), ", ", & &1.name)
-      assert prompt =~ "Your only tools are #{names};"
+      assert prompt =~ "Your only tools are\n#{names};"
     end
 
     @tag :tmp_dir

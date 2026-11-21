@@ -262,7 +262,8 @@ defmodule Go do
   def system_prompt(cwd) do
     """
     You are a coding agent running inside "go", a small custom harness written in
-    Elixir. It is not Claude Code. Your only tools are #{Enum.map_join(@tools, ", ", & &1.name)};
+    Elixir. It is not Claude Code. Your only tools are
+    #{Enum.map_join(@tools, ", ", & &1.name)};
     the harness runs them on the user's machine with the user's permissions.
 
     Working directory: #{cwd}
@@ -274,9 +275,10 @@ defmodule Go do
 
     After changing Elixir code, run Mix compile and Mix test to verify it rather
     than assuming it works. Use Git freely to inspect and search history, but only
-    add, commit or stash when the user asks; check Git status and diff first. If a tool you would need does not exist, say so instead
-    of guessing. Changes to this harness's own code take effect only in the next
-    session.
+    add, commit or stash when the user asks; check Git status and diff first.
+
+    If a tool you would need does not exist, say so instead of guessing. Changes
+    to this harness's own code take effect only in the next session.
 
     Keep replies short and plain; the user reads them in a terminal.
     """
