@@ -1,6 +1,9 @@
 # Go
 
-**TODO: Add description**
+```zsh
+source .env
+mix run --no-start go.exs "your prompt here"
+```
 
 ## Installation
 
