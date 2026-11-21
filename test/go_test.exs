@@ -72,4 +72,32 @@ defmodule GoTest do
       end
     end
   end
+
+  describe "instruction context" do
+    test "system prompt names every tool the harness sends" do
+      prompt = Go.system_prompt("/some/project")
+
+      assert prompt =~ "Working directory: /some/project"
+
+      for %{name: name} <- Go.tools() do
+        assert prompt =~ name, "system prompt does not mention the #{name} tool"
+      end
+    end
+
+    @tag :tmp_dir
+    test "first message is just the prompt when there is no AGENTS.md", %{tmp_dir: dir} do
+      assert Go.first_message("hello", dir) == "hello"
+    end
+
+    @tag :tmp_dir
+    test "first message puts AGENTS.md in front of the prompt", %{tmp_dir: dir} do
+      File.write!(Path.join(dir, "AGENTS.md"), "# Rules\nUse tabs.\n\n")
+
+      message = Go.first_message("fix the bug", dir)
+
+      assert message =~ ~s(<project_instructions source="AGENTS.md">)
+      assert message =~ "# Rules\nUse tabs.\n</project_instructions>"
+      assert String.ends_with?(message, "</project_instructions>\n\nfix the bug")
+    end
+  end
 end

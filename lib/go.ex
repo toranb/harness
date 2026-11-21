@@ -141,13 +141,78 @@ defmodule Go do
     }
   ]
 
+  @doc false
+  def tools, do: @tools
+
+  @doc false
+  # Hardcoded harness instructions, sent as the top-level `system` field on
+  # every request. Kept identical across calls (cwd only changes between
+  # sessions) so it never invalidates a cached prefix.
+  def system_prompt(cwd) do
+    """
+    You are a coding agent running inside "go", a small custom harness written in
+    Elixir. It is not Claude Code: you only have the tools listed below, and the
+    harness runs them on the user's machine with the user's permissions.
+
+    Working directory: #{cwd}
+    Relative paths resolve against it; prefer them.
+
+    Tools:
+    - Read, Write, Edit: local files. Read a file before you Edit it. Edit replaces
+      one exact, unique occurrence of old_string; include surrounding lines if needed.
+    - Grep: regex search (PCRE) of a file or directory, line by line.
+    - WebFetch: simple HTTP GET of a URL.
+    - Curl: the native curl binary for requests that need headers, cookies, methods
+      or a body. Arguments go in an array; there is no shell.
+    - Mix: runs one allowlisted mix task (deps.get, compile, test, format) in the
+      working directory.
+
+    There is no shell tool. You cannot pipe, redirect, chain commands or run
+    arbitrary programs. To search a large web response, save it with Curl -o <file>
+    and Grep that file instead of reading it whole.
+
+    After changing Elixir code, run Mix compile and Mix test to verify it rather
+    than assuming it works. If a tool you would need does not exist, say so instead
+    of guessing. Changes to this harness's own code take effect only in the next
+    session.
+
+    Keep replies short and plain; the user reads them in a terminal.
+    """
+  end
+
+  @doc false
+  # The first user message of a session. If the working directory has an
+  # AGENTS.md, it goes in front of the prompt so the project's own
+  # instructions stay in context for the whole conversation.
+  def first_message(prompt, cwd) do
+    path = Path.join(cwd, "AGENTS.md")
+
+    case File.read(path) do
+      {:ok, agents_md} ->
+        """
+        <project_instructions source="AGENTS.md">
+        The project's AGENTS.md is below. Follow it as instructions from the user
+        for this project, unless it conflicts with the user's message.
+
+        #{String.trim(agents_md)}
+        </project_instructions>
+
+        #{prompt}\
+        """
+
+      {:error, _} ->
+        prompt
+    end
+  end
+
   @doc """
   Interactive agent session. Starts from a prompt, runs tools until the
   model finishes its turn, then waits at a `>` prompt for the next message.
   The conversation keeps its history across prompts.
   Type `exit` or press Ctrl-D to quit.
   """
-  def run(prompt) when is_binary(prompt), do: run([%{role: "user", content: prompt}])
+  def run(prompt) when is_binary(prompt),
+    do: run([%{role: "user", content: first_message(prompt, File.cwd!())}])
 
   def run(messages) when is_list(messages) do
     {:ok, _} = Application.ensure_all_started(:req)
@@ -155,6 +220,7 @@ defmodule Go do
     body = %{
       model: System.get_env("API_MODEL", "claude-haiku-5-5"),
       max_tokens: 16_000,
+      system: system_prompt(File.cwd!()),
       tools: @tools,
       messages: messages
     }
