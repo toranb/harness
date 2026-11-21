@@ -8,6 +8,7 @@ ExUnit.start()
 
 defmodule GoTest do
   use ExUnit.Case
+  import ExUnit.CaptureIO
 
   # Go.run/1 calls the live Claude API, so the test only checks that it exists.
   test "exposes the agent entry point" do
@@ -82,14 +83,12 @@ defmodule GoTest do
   end
 
   describe "instruction context" do
-    test "system prompt names every tool the harness sends" do
+    test "system prompt lists exactly the tools the API receives" do
       prompt = Go.system_prompt("/some/project")
 
       assert prompt =~ "Working directory: /some/project"
-
-      for %{name: name} <- Go.tools() do
-        assert prompt =~ name, "system prompt does not mention the #{name} tool"
-      end
+      names = Enum.map_join(Go.tools(), ", ", & &1.name)
+      assert prompt =~ "Your only tools are #{names};"
     end
 
     @tag :tmp_dir
@@ -124,6 +123,89 @@ defmodule GoTest do
 
       assert Map.take(first, [:model, :system, :tools]) ==
                Map.take(later, [:model, :system, :tools])
+    end
+  end
+
+  describe "bug fixes" do
+    @tag :tmp_dir
+    test "Edit rejects an empty old_string with a clear message", %{tmp_dir: dir} do
+      path = Path.join(dir, "f.txt")
+      File.write!(path, "abc")
+
+      assert_raise RuntimeError, "old_string must not be empty", fn ->
+        Go.execute_tool("Edit", %{"file_path" => path, "old_string" => "", "new_string" => "x"})
+      end
+
+      assert File.read!(path) == "abc"
+    end
+
+    @tag :tmp_dir
+    test "Read truncates large files and says so", %{tmp_dir: dir} do
+      path = Path.join(dir, "big.txt")
+      File.write!(path, String.duplicate("a", 60_000))
+
+      {output, false} = Go.execute_tool("Read", %{"file_path" => path})
+
+      assert output =~ "(truncated: showing the first 50000 of 60000 characters"
+      assert String.length(output) < 50_200
+    end
+
+    @tag :tmp_dir
+    test "Grep skips _build, deps and node_modules unless asked", %{tmp_dir: dir} do
+      for sub <- ["lib", "deps/req", "_build/dev", "node_modules/x"] do
+        File.mkdir_p!(Path.join(dir, sub))
+        File.write!(Path.join([dir, sub, "f.ex"]), "needle")
+      end
+
+      {out, false} = Go.execute_tool("Grep", %{"pattern" => "needle", "path" => dir})
+      assert out =~ "lib/f.ex"
+      refute out =~ ~r{/(deps|_build|node_modules)/}
+
+      {out, false} =
+        Go.execute_tool("Grep", %{"pattern" => "needle", "path" => Path.join(dir, "deps")})
+
+      assert out =~ "deps/req/f.ex"
+    end
+
+    test "a blank prompt asks at > and blank lines are skipped" do
+      output =
+        capture_io("\n  \nexit\n", fn ->
+          send(self(), {:result, Go.run("   ")})
+        end)
+
+      assert_received {:result, :exit}
+      assert output =~ ">"
+    end
+
+    test "read_user_input returns text, or :exit on exit or Ctrl-D" do
+      capture_io("\nhello\n", fn -> send(self(), Go.read_user_input()) end)
+      assert_received {:ok, "hello"}
+
+      capture_io("quit\n", fn -> send(self(), Go.read_user_input()) end)
+      assert_received :exit
+
+      capture_io("", fn -> send(self(), Go.read_user_input()) end)
+      assert_received :exit
+    end
+  end
+
+  describe "loop visibility" do
+    test "turn status adds up the prompt size from the usage fields" do
+      usage = %{
+        "input_tokens" => 4,
+        "cache_read_input_tokens" => 2206,
+        "cache_creation_input_tokens" => 18,
+        "output_tokens" => 57
+      }
+
+      assert Go.turn_status(2, "tool_use", usage) ==
+               "[turn 2] stop_reason=tool_use | prompt 2228 tokens " <>
+                 "(cache read 2206, cache write 18, uncached 4) | output 57 tokens"
+    end
+
+    test "result summary shows status, size and the start of the first line" do
+      assert Go.result_summary("line one\nline two", false) == "ok, 17 chars: line one"
+      assert Go.result_summary("boom", true) == "error, 4 chars: boom"
     end
   end
 end

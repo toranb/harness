@@ -22,7 +22,9 @@ defmodule Go do
   @tools [
     %{
       name: "Read",
-      description: "Read a file from the local filesystem and return its contents.",
+      description:
+        "Read a file from the local filesystem and return its contents " <>
+          "(truncated to 50,000 characters; use Grep to find parts of larger files).",
       input_schema: %{
         type: "object",
         properties: %{file_path: %{type: "string", description: "Path of the file to read"}},
@@ -108,7 +110,8 @@ defmodule Go do
         "Search a file, or every file under a directory, for a regular expression " <>
           "(PCRE syntax, matched line by line) and return matches as file:line:text. " <>
           "Like `grep -n`; set only_matching to return just the matched text (`grep -o`). " <>
-          "Use it to pull specific pieces out of large files, such as a page saved with Curl -o.",
+          "Use it to pull specific pieces out of large files, such as a page saved with Curl -o. " <>
+          "Directory searches skip _build, deps and node_modules; pass one as the path to search it.",
       input_schema: %{
         type: "object",
         properties: %{
@@ -152,31 +155,33 @@ defmodule Go do
     }
   ]
 
-  @doc false
+  # Every tool result is cut to this many characters, so one big file or web
+  # page can't flood the context window. truncate/1 adds a note when it cuts.
+  @max_output 50_000
+
+  # Grep skips these when it walks a directory: build output and vendored
+  # dependencies are large and rarely what you're looking for.
+  @grep_skip_dirs ~w(_build deps node_modules)
+
+  @doc "The tool definitions sent to the API with every request."
   def tools, do: @tools
 
-  @doc false
-  # Hardcoded harness instructions, sent as the top-level `system` field on
-  # every request. Kept identical across calls (cwd only changes between
-  # sessions) so it never invalidates a cached prefix.
+  @doc """
+  The harness instructions, sent as the top-level `system` field.
+
+  The tool names come from `@tools`, so this list can't drift from what the
+  API actually receives; how to use each tool lives in its own description.
+  The text depends only on `cwd`, so it is byte-identical for every request in
+  a session, which keeps it cacheable (see `request_body/2`).
+  """
   def system_prompt(cwd) do
     """
     You are a coding agent running inside "go", a small custom harness written in
-    Elixir. It is not Claude Code: you only have the tools listed below, and the
-    harness runs them on the user's machine with the user's permissions.
+    Elixir. It is not Claude Code. Your only tools are #{Enum.map_join(@tools, ", ", & &1.name)};
+    the harness runs them on the user's machine with the user's permissions.
 
     Working directory: #{cwd}
     Relative paths resolve against it; prefer them.
-
-    Tools:
-    - Read, Write, Edit: local files. Read a file before you Edit it. Edit replaces
-      one exact, unique occurrence of old_string; include surrounding lines if needed.
-    - Grep: regex search (PCRE) of a file or directory, line by line.
-    - WebFetch: simple HTTP GET of a URL.
-    - Curl: the native curl binary for requests that need headers, cookies, methods
-      or a body. Arguments go in an array; there is no shell.
-    - Mix: runs one allowlisted mix task (deps.get, compile, test, format) in the
-      working directory.
 
     There is no shell tool. You cannot pipe, redirect, chain commands or run
     arbitrary programs. To search a large web response, save it with Curl -o <file>
@@ -191,10 +196,12 @@ defmodule Go do
     """
   end
 
-  @doc false
-  # The first user message of a session. If the working directory has an
-  # AGENTS.md, it goes in front of the prompt so the project's own
-  # instructions stay in context for the whole conversation.
+  @doc """
+  Builds the first user message of a session.
+
+  If the working directory has an AGENTS.md, it goes in front of the prompt,
+  so the project's own instructions stay in context for the whole conversation.
+  """
   def first_message(prompt, cwd) do
     path = Path.join(cwd, "AGENTS.md")
 
@@ -216,15 +223,20 @@ defmodule Go do
     end
   end
 
-  @doc false
-  # Prompt caching. The API renders tools -> system -> messages, and a cache
-  # entry covers everything up to a breakpoint. Two breakpoints:
-  #   1. explicit, on the system prompt: caches tools + system, which are
-  #      identical for every request (and every session in the same folder);
-  #   2. automatic (top-level cache_control): the API puts it on the last
-  #      block and moves it forward as the conversation grows, so each loop
-  #      iteration reads the previous request's prefix from cache.
-  # Anything that changes those bytes (tool list, system text, model) misses.
+  @doc """
+  Builds the JSON body for one Messages API request.
+
+  Prompt caching: the API renders tools -> system -> messages, and a cache
+  entry covers everything up to a breakpoint. There are two breakpoints:
+
+    1. explicit, on the system prompt: caches tools + system, which are the
+       same for every request (and every session in the same folder);
+    2. automatic (top-level `cache_control`): the API puts it on the last
+       block and moves it forward as the conversation grows, so each request
+       reads the previous request's prefix from cache.
+
+  Anything that changes those bytes (tool list, system text, model) misses.
+  """
   def request_body(messages, cwd) do
     %{
       model: System.get_env("API_MODEL", "claude-haiku-5-5"),
@@ -238,21 +250,78 @@ defmodule Go do
     }
   end
 
-  @doc """
-  Interactive agent session. Starts from a prompt, runs tools until the
-  model finishes its turn, then waits at a `>` prompt for the next message.
-  The conversation keeps its history across prompts.
-  Type `exit` or press Ctrl-D to quit.
-  """
-  def run(prompt) when is_binary(prompt),
-    do: run([%{role: "user", content: first_message(prompt, File.cwd!())}])
+  # ---------------------------------------------------------------------------
+  # The agent loop
+  # ---------------------------------------------------------------------------
 
-  def run(messages) when is_list(messages) do
+  @doc """
+  Starts an interactive session. This is the whole agent loop:
+
+    1. send the conversation to the model (`call_model/1`)
+    2. if the model asked for tools, run them (`run_tools/1`), append the
+       results to the conversation and go back to 1
+    3. otherwise its turn is over: read the user's next message
+       (`read_user_input/0`), append it and go back to 1
+
+  The conversation (`messages`) only ever grows, and every request sends all
+  of it. A blank prompt asks for one at `>`. Type `exit` or press Ctrl-D to quit.
+  """
+  def run(prompt) when is_binary(prompt) do
     {:ok, _} = Application.ensure_all_started(:req)
 
+    case String.trim(prompt) do
+      "" ->
+        with {:ok, prompt} <- read_user_input(), do: run(prompt)
+
+      prompt ->
+        loop([%{role: "user", content: first_message(prompt, File.cwd!())}], 1)
+    end
+  end
+
+  # One pass = one request to the model. `turn` counts requests, for display.
+  defp loop(messages, turn) do
+    case call_model(messages) do
+      {:ok, response} ->
+        print_response(response, turn)
+        # Append the assistant's content unchanged (thinking blocks included).
+        messages = messages ++ [%{role: "assistant", content: response["content"]}]
+
+        if response["stop_reason"] == "tool_use" do
+          results = run_tools(response["content"])
+          loop(messages ++ [%{role: "user", content: results}], turn + 1)
+        else
+          next_prompt(messages, turn + 1)
+        end
+
+      {:error, reason} ->
+        IO.puts("\n[api error] #{reason}")
+        IO.puts("The conversation is kept. Press Enter to retry this request, or type exit.")
+
+        case read_line("retry> ") do
+          answer when answer in [:eof, "exit", "quit"] -> :ok
+          _ -> loop(messages, turn)
+        end
+    end
+  end
+
+  # The model finished its turn: wait for the user's next message.
+  defp next_prompt(messages, turn) do
+    case read_user_input() do
+      {:ok, text} -> loop(messages ++ [%{role: "user", content: text}], turn)
+      :exit -> :ok
+    end
+  end
+
+  @doc """
+  Sends the conversation to the Messages API.
+
+  Returns `{:ok, response_body}` or `{:error, reason}`. Errors are returned
+  rather than raised, so a failed request doesn't end the session.
+  With `--debug`, prints the full request body first.
+  """
+  def call_model(messages) do
     body = request_body(messages, File.cwd!())
 
-    # --debug: dump the full request body (the whole context) on every call.
     if Application.get_env(:go, :debug, false) do
       IO.inspect(body,
         label: "\n[debug] POST /v1/messages (#{length(messages)} messages)",
@@ -262,8 +331,8 @@ defmodule Go do
       )
     end
 
-    resp =
-      Req.post!("https://api.anthropic.com/v1/messages",
+    result =
+      Req.post("https://api.anthropic.com/v1/messages",
         headers: [
           {"x-api-key", System.fetch_env!("API_KEY")},
           {"anthropic-version", "2026-10-21"}
@@ -272,51 +341,95 @@ defmodule Go do
         receive_timeout: 600_000
       )
 
-    if resp.status != 200, do: raise("API error #{resp.status}: #{inspect(resp.body)}")
-
-    %{"content" => content, "stop_reason" => stop_reason} = resp.body
-
-    for %{"type" => "text", "text" => text} <- content, do: IO.puts(text)
-
-    # Append the full content (thinking blocks included) unchanged.
-    messages = messages ++ [%{role: "assistant", content: content}]
-
-    case stop_reason do
-      "tool_use" ->
-        results =
-          for %{"type" => "tool_use", "id" => id, "name" => name, "input" => input} <- content do
-            IO.puts("-> #{name} #{inspect(input)}")
-
-            {output, error?} =
-              try do
-                execute_tool(name, input)
-              rescue
-                e -> {Exception.message(e), true}
-              end
-
-            %{type: "tool_result", tool_use_id: id, content: output, is_error: error?}
-          end
-
-        run(messages ++ [%{role: "user", content: results}])
-
-      "end_turn" ->
-        # Turn is done: wait for the next prompt (skipping blank lines).
-        input =
-          Stream.repeatedly(fn -> IO.gets("\n> ") end)
-          |> Enum.find(&(not is_binary(&1) or String.trim(&1) != ""))
-
-        if is_binary(input) and String.trim(input) not in ["exit", "quit"],
-          do: run(messages ++ [%{role: "user", content: String.trim(input)}]),
-          else: :ok
-
-      other ->
-        raise "Agent stopped with stop_reason=#{other}"
+    case result do
+      {:ok, %{status: 200, body: response}} -> {:ok, response}
+      {:ok, %{status: status, body: body}} -> {:error, "HTTP #{status}: #{inspect(body)}"}
+      {:error, exception} -> {:error, Exception.message(exception)}
     end
   end
 
-  @doc false
-  # Runs one tool call. Returns {output, is_error}.
-  def execute_tool("Read", %{"file_path" => path}), do: {File.read!(path), false}
+  # Prints the model's text, then one status line so you can watch the loop.
+  defp print_response(%{"content" => content} = response, turn) do
+    for %{"type" => "text", "text" => text} <- content, do: IO.puts(text)
+    IO.puts(turn_status(turn, response["stop_reason"], response["usage"]))
+  end
+
+  @doc """
+  Formats the status line printed after every model response: the request
+  number, why the model stopped, and how big the conversation now is.
+
+  The prompt size is the sum of three usage fields: tokens read from cache,
+  tokens written to cache, and uncached input. Watching it grow each turn is
+  the clearest picture of how an agent's context fills up.
+  """
+  def turn_status(turn, stop_reason, usage) do
+    read = usage["cache_read_input_tokens"] || 0
+    written = usage["cache_creation_input_tokens"] || 0
+    uncached = usage["input_tokens"] || 0
+
+    "[turn #{turn}] stop_reason=#{stop_reason} | prompt #{read + written + uncached} tokens " <>
+      "(cache read #{read}, cache write #{written}, uncached #{uncached}) | " <>
+      "output #{usage["output_tokens"] || 0} tokens"
+  end
+
+  # Runs every tool call in the model's response, in order, and returns one
+  # tool_result per call. They all go back together in a single user message.
+  defp run_tools(content) do
+    for %{"type" => "tool_use", "id" => id, "name" => name, "input" => input} <- content do
+      IO.puts("-> #{name} #{inspect(input, printable_limit: 200)}")
+
+      {output, error?} =
+        try do
+          execute_tool(name, input)
+        rescue
+          e -> {Exception.message(e), true}
+        end
+
+      IO.puts("<- " <> result_summary(output, error?))
+      %{type: "tool_result", tool_use_id: id, content: output, is_error: error?}
+    end
+  end
+
+  @doc """
+  One-line summary of a tool result for the terminal: ok/error, its size, and
+  the start of its first line. The model always gets the full result.
+  """
+  def result_summary(output, error?) do
+    first_line = output |> String.split("\n", parts: 2) |> hd() |> String.slice(0, 100)
+    "#{if error?, do: "error", else: "ok"}, #{String.length(output)} chars: #{first_line}"
+  end
+
+  @doc """
+  Reads the user's next message at the `>` prompt, skipping blank lines.
+  Returns `{:ok, text}`, or `:exit` for `exit`, `quit` or Ctrl-D.
+  """
+  def read_user_input do
+    case read_line("\n> ") do
+      :eof -> :exit
+      "" -> read_user_input()
+      text when text in ["exit", "quit"] -> :exit
+      text -> {:ok, text}
+    end
+  end
+
+  defp read_line(label) do
+    case IO.gets(label) do
+      line when is_binary(line) -> String.trim(line)
+      _ -> :eof
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Tools
+  # ---------------------------------------------------------------------------
+
+  @doc """
+  Runs one tool call by name and returns `{output, is_error}`.
+
+  A clause may also raise: `run_tools/1` turns the exception message into an
+  error result, so the model sees what went wrong and can try again.
+  """
+  def execute_tool("Read", %{"file_path" => path}), do: {truncate(File.read!(path)), false}
 
   def execute_tool("Write", %{"file_path" => path, "content" => body}) do
     File.mkdir_p!(Path.dirname(path))
@@ -325,10 +438,10 @@ defmodule Go do
   end
 
   def execute_tool("Edit", %{"file_path" => path, "old_string" => old, "new_string" => new}) do
+    if old == "", do: raise("old_string must not be empty")
     text = File.read!(path)
 
     case length(:binary.matches(text, old)) do
-      _ when old == "" -> raise "old_string must not be empty"
       0 -> raise "old_string not found in #{path}"
       1 -> File.write!(path, String.replace(text, old, new, global: false))
       n -> raise "old_string matches #{n} times in #{path}; include more context"
@@ -339,7 +452,7 @@ defmodule Go do
 
   def execute_tool("WebFetch", %{"url" => url}) do
     r = Req.get!(url, decode_body: false, receive_timeout: 30_000)
-    {"HTTP #{r.status}\n\n" <> String.slice(to_string(r.body), 0, 50_000), false}
+    {"HTTP #{r.status}\n\n" <> truncate(to_string(r.body)), false}
   end
 
   def execute_tool("Curl", %{"args" => args}) when is_list(args) do
@@ -363,7 +476,7 @@ defmodule Go do
         nil -> {out, "HTTP ???"}
       end
 
-    output = String.slice(body, 0, 50_000) <> "\n\n" <> status_line <> " (exit #{exit_code})"
+    output = truncate(body) <> "\n\n" <> status_line <> " (exit #{exit_code})"
     {output, exit_code != 0}
   end
 
@@ -375,7 +488,7 @@ defmodule Go do
     files =
       cond do
         File.regular?(path) -> [path]
-        File.dir?(path) -> Path.wildcard(Path.join(path, "**/*")) |> Enum.filter(&File.regular?/1)
+        File.dir?(path) -> files_under(path)
         true -> raise "No such file or directory: #{path}"
       end
 
@@ -392,7 +505,7 @@ defmodule Go do
     output =
       case results do
         [] -> "No matches"
-        _ -> Enum.take(results, max) |> Enum.join("\n") |> String.slice(0, 50_000)
+        _ -> Enum.take(results, max) |> Enum.join("\n") |> truncate()
       end
 
     note = if length(results) > max, do: "\n\n(stopped at max_results=#{max})", else: ""
@@ -407,7 +520,7 @@ defmodule Go do
   def execute_tool("Mix", %{"task" => task}) do
     # Task name goes straight to the mix binary as one argv element (no shell).
     {out, exit_code} = System.cmd("mix", [task], stderr_to_stdout: true)
-    output = String.slice(out, 0, 50_000) <> "\n\n(exit #{exit_code})"
+    output = truncate(out) <> "\n\n(exit #{exit_code})"
     {output, exit_code != 0}
   end
 
@@ -426,22 +539,39 @@ defmodule Go do
       end
     end)
   end
+
+  # Every regular file under dir, skipping @grep_skip_dirs (and, because
+  # Path.wildcard ignores dotfiles, .git and other hidden folders).
+  defp files_under(dir) do
+    Path.wildcard(Path.join(dir, "**/*"))
+    |> Enum.reject(fn file ->
+      file |> Path.relative_to(dir) |> Path.split() |> Enum.any?(&(&1 in @grep_skip_dirs))
+    end)
+    |> Enum.filter(&File.regular?/1)
+  end
+
+  @doc """
+  Cuts text to `@max_output` characters, with a note saying so, so the model
+  knows it is not seeing everything.
+  """
+  def truncate(text) do
+    length = String.length(text)
+
+    if length <= @max_output do
+      text
+    else
+      String.slice(text, 0, @max_output) <>
+        "\n\n(truncated: showing the first #{@max_output} of #{length} characters; " <>
+        "use Grep to find the part you need)"
+    end
+  end
 end
 
-# Entry point. harness_test.exs loads this file with :no_main set so it can
-# test the Go module without starting a session.
+# Entry point: `elixir harness.exs [--debug] [prompt...]`. With no prompt,
+# Go.run/1 asks for one at `>`. harness_test.exs loads this file with
+# :no_main set so it can test the Go module without starting a session.
 unless Application.get_env(:go, :no_main, false) do
   {opts, args, _} = OptionParser.parse(System.argv(), strict: [debug: :boolean])
   Application.put_env(:go, :debug, Keyword.get(opts, :debug, false))
-
-  case args do
-    [] ->
-      case IO.gets("> ") do
-        prompt when is_binary(prompt) -> Go.run(String.trim(prompt))
-        _ -> :ok
-      end
-
-    args ->
-      Go.run(Enum.join(args, " "))
-  end
+  Go.run(Enum.join(args, " "))
 end
