@@ -74,18 +74,30 @@ defmodule Go do
   def run(messages) when is_list(messages) do
     {:ok, _} = Application.ensure_all_started(:req)
 
+    body = %{
+      model: System.get_env("API_MODEL", "claude-haiku-5-5"),
+      max_tokens: 16_000,
+      tools: @tools,
+      messages: messages
+    }
+
+    # --debug: dump the full request body (the whole context) on every call.
+    if Application.get_env(:go, :debug, false) do
+      IO.inspect(body,
+        label: "\n[debug] POST /v1/messages (#{length(messages)} messages)",
+        pretty: true,
+        limit: :infinity,
+        printable_limit: :infinity
+      )
+    end
+
     resp =
       Req.post!("https://api.anthropic.com/v1/messages",
         headers: [
           {"x-api-key", System.fetch_env!("API_KEY")},
           {"anthropic-version", "2026-10-21"}
         ],
-        json: %{
-          model: System.get_env("API_MODEL", "claude-haiku-5-5"),
-          max_tokens: 16_000,
-          tools: @tools,
-          messages: messages
-        },
+        json: body,
         receive_timeout: 600_000
       )
 

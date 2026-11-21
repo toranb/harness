@@ -2,6 +2,8 @@
 
 ```zsh
 source .env
+mix run --no-start go.exs
+mix run --no-start go.exs --debug
 mix run --no-start go.exs "your prompt here"
 ```
 
