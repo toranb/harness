@@ -96,7 +96,7 @@ is not saved after you exit.
 - **A visible agent loop.** After every response it prints the turn number,
   why the model stopped, and how many tokens the conversation now uses. Every
   tool call prints its input and a one-line summary of its result.
-- **Seven tools:** Read, Write, Edit, Grep, WebFetch, Curl and Mix
+- **Eight tools:** Read, Write, Edit, Grep, WebFetch, Curl, Mix and Git
   ([details](#tools)). There is no shell tool, so the model can only do what
   these tools allow.
 - **A system prompt** that tells the model what this harness is, which
@@ -153,7 +153,7 @@ Step by step, using the function names in `harness.exs`:
    `AGENTS.md` if there is one, and starts the loop.
 2. **`loop/2`** runs once per request to the model. It calls
    **`call_model/2`**, which uses **`request_body/2`** to build the request.
-   That is the model name, `max_tokens`, the system prompt, the seven tool
+   That is the model name, `max_tokens`, the system prompt, the eight tool
    definitions, and the *entire* conversation so far. The model has no memory
    between requests; the conversation in `messages` is its only memory, and
    every request sends all of it.
@@ -212,14 +212,14 @@ the retry prompt after an API error.
 
 Every request has the same four parts, in this order:
 
-1. **Tools**: the seven tool definitions in `@tools`. Each has a name, a
+1. **Tools**: the eight tool definitions in `@tools`. Each has a name, a
    description that tells the model when and how to use it, and a JSON input
    schema. `strict: true` makes the API guarantee that tool inputs match the
    schema.
 2. **System prompt** (`system_prompt/1`): what this harness is, the working
    directory, the tool names (built from `@tools` so the two can't drift),
-   that there is no shell, to verify code changes with Mix, and to keep
-   replies short.
+   that there is no shell, to verify code changes with Mix, to only stage
+   or commit with Git when you ask, and to keep replies short.
 3. **First user message** (`first_message/2`): the contents of `AGENTS.md`
    wrapped in `<project_instructions>`, if the file exists, followed by your
    prompt.
@@ -239,11 +239,53 @@ Run with `--debug` to see the full request for every turn.
 | **WebFetch** | Plain HTTP GET of a URL | 30-second timeout, body cut at 50,000 characters |
 | **Curl** | Runs the real `curl` with an array of arguments, for headers, cookies, methods and request bodies | Adds `--silent --show-error --max-time 60` and reports the HTTP status and exit code. Output cut at 50,000 characters |
 | **Mix** | Runs one mix task in the working directory | Only `deps.get`, `compile`, `test` and `format`, with no extra arguments |
+| **Git** | Runs one git subcommand with an array of arguments in the working directory, to inspect and search history and make local commits | Only `status`, `log`, `diff`, `show`, `add`, `commit` and `stash`. Some flags are refused (see below). Output cut at 50,000 characters |
 
 Without a shell, the model can't pipe output between programs. To search a
 large web page it saves the page with `Curl -o page.html`, then runs `Grep`
 on the file. The system prompt and the Curl description both point it to
 this approach.
+
+### The Git tool
+
+Git lets the agent search history and make local commits, but nothing that
+talks to a remote (`push`, `pull`, `fetch`) or rewrites history (`reset`,
+`rebase`, `commit --amend`). The system prompt tells the model to use it
+freely for reading, but to stage, commit or stash only when you ask, and to
+check `status` and `diff` first.
+
+Searching history uses `git log`:
+
+| To find | Arguments |
+|---|---|
+| Commits whose message mentions a word | `log --oneline --grep=cache` (add `-i` to ignore case) |
+| Commits that added or removed some text | `log --oneline -S "hello cache"` |
+| Commits whose changes match a regex | `log --oneline -G "def \w+_stream"` |
+| One commit in full | `show <sha>` |
+
+`git_refusal/2` checks every call before it runs. It refuses:
+
+| Refused | Why |
+|---|---|
+| Any subcommand not in `@git_subcommands` | Keeps the tool to reading history and local commits |
+| `commit --amend` | Rewrites the last commit |
+| `commit --no-verify` / `-n` | Skips the repo's commit hooks |
+| `add --force` / `-f` | Adds files `.gitignore` excludes, such as `.env` |
+| `stash drop`, `stash clear` | Deletes stashes (allowed: `push`, `list`, `show`, `pop`, `apply`) |
+| `--interactive`, `--patch`, `--edit` and their short forms on `add`, `commit`, `stash` | They wait for a terminal or editor, which would hang the session |
+| `--output`, `--ext-diff` on any subcommand | Writes a file outside git's control / runs an external program |
+
+The check also catches bundled short flags (`-fA` contains `-f`) and long
+flags with a value (`--output=x`), and skips everything after `--`, which
+git treats as file paths. The subcommand is always the first argument, so the
+model can't add global options such as `-c` or `--git-dir` in front of it.
+Git runs with `GIT_EDITOR=true` and no pager: a commit without `-m` fails
+instead of waiting for an editor that will never open.
+
+In a test in a throwaway clone of this repo, the agent found the streaming
+commit with `log --grep` and `log -S`, staged and committed one new file
+after checking `diff --cached`, and when asked to amend it, explained that
+the tool refuses `--amend`.
 
 When a tool fails, for example because a file is missing or an Edit
 `old_string` isn't found, the error message goes back to the model as a
@@ -409,9 +451,14 @@ This is a learning tool, not a sandbox.
 - **Tools run with your permissions, and nothing asks you first.** Write and
   Edit can change any file you can change, and Read can read any file you can
   read, including outside the working directory.
-- **There is no shell.** Curl and Mix call their programs directly with an
-  argument list, so an argument like `"x; rm -rf ~"` is passed as text and
-  never run as a command. Mix only accepts its four allowed tasks.
+- **There is no shell.** Curl, Mix and Git call their programs directly
+  with an argument list, so an argument like `"x; rm -rf ~"` is passed as
+  text and never run as a command. Mix only accepts its four allowed tasks.
+- **Git can commit, but only locally.** It can't push, reset, rebase or
+  amend, and it refuses `add --force`, so ignored files such as `.env` stay
+  out. A plain `git add .` still stages anything that isn't ignored, so keep
+  secrets in `.gitignore`. Commits run the repo's own hooks, as they would
+  for you.
 - **Curl and WebFetch can reach any URL.** The model can send what it reads
   (files, `.env`) to the network if it decides to.
 - **AGENTS.md is followed as your instructions.** Only run the agent in
@@ -426,7 +473,8 @@ This is a learning tool, not a sandbox.
 | Part | What it is |
 |---|---|
 | `Mix.install([{:req, "0.7.5"}])` | The single dependency, pinned so every install is the same |
-| `@mix_tasks`, `@tools` | The Mix allowlist and the seven tool definitions sent to the API |
+| `@mix_tasks`, `@git_subcommands`, `@git_blocked_flags`, `@git_stash_actions` | What the Mix and Git tools allow and refuse |
+| `@tools` | The eight tool definitions sent to the API |
 | `@max_output`, `@grep_skip_dirs` | The 50,000-character output limit and the folders Grep skips |
 | `system_prompt/1`, `first_message/2`, `request_body/2` | What goes into each request |
 | `run/1`, `start/1`, `loop/2`, `next_prompt/2`, `add_user_text/2` | The agent loop |
@@ -437,6 +485,7 @@ This is a learning tool, not a sandbox.
 | `read_user_input/0`, `parse_input/1` | The `>` prompt: messages, `/commands` and `exit` |
 | `compact/3`, `compaction_prompt/1`, `extract_summary/1`, `compacted_messages/2` | `/compact` |
 | `execute_tool/2` | One clause per tool |
+| `git_refusal/2` | Why a Git call is refused, or `nil` |
 | `truncate/1`, `files_under/1`, `grep_lines/4` | Helpers for the tools |
 | Entry point (bottom of file) | Parses `--debug` and calls `Go.run/1`; skipped when the tests load the file |
 

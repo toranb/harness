@@ -13,11 +13,55 @@ defmodule Go do
   @moduledoc """
   A bare-bones agent loop over the Claude Messages API with
   client-side tools that mirror Claude Code's: Read, Write, Edit, WebFetch, Grep,
-  plus Curl, which shells out to the native `curl` binary.
+  plus Curl, Mix and Git, which run the native `curl`, `mix` and `git`.
   """
 
   # The only mix tasks the Mix tool will run.
   @mix_tasks ~w(deps.get compile test format)
+
+  # The git subcommands the Git tool will run: enough to inspect and search
+  # history (status, log, diff, show) and to make local commits (add,
+  # commit, stash). Nothing that talks to a remote or rewrites history.
+  @git_subcommands ~w(status log diff show add commit stash)
+
+  # Flags the Git tool refuses, per subcommand, with the reason. They would
+  # rewrite history, skip the repo's safeguards, write files outside git's
+  # control, run external programs, or wait for an editor or terminal the
+  # harness doesn't have (which would hang the session).
+  @git_blocked_flags %{
+    "commit" => [
+      {"--amend", "rewrites the last commit"},
+      {"--no-verify", "skips the repo's commit hooks"},
+      {"-n", "skips the repo's commit hooks"},
+      {"--interactive", "needs a terminal"},
+      {"--patch", "needs a terminal"},
+      {"-p", "needs a terminal"},
+      {"--edit", "needs an editor"},
+      {"-e", "needs an editor"}
+    ],
+    "add" => [
+      {"--force", "adds files that .gitignore excludes, such as .env"},
+      {"-f", "adds files that .gitignore excludes, such as .env"},
+      {"--interactive", "needs a terminal"},
+      {"-i", "needs a terminal"},
+      {"--patch", "needs a terminal"},
+      {"-p", "needs a terminal"},
+      {"--edit", "needs an editor"},
+      {"-e", "needs an editor"}
+    ],
+    "stash" => [
+      {"--patch", "needs a terminal"},
+      {"-p", "needs a terminal"}
+    ],
+    :all => [
+      {"--output", "writes output to a file"},
+      {"--ext-diff", "runs an external diff program"}
+    ]
+  }
+
+  # `git stash <action>`: the ones that delete stashes (drop, clear) are
+  # left out. No action means `push`.
+  @git_stash_actions ~w(push list show pop apply)
 
   @tools [
     %{
@@ -152,6 +196,34 @@ defmodule Go do
         additionalProperties: false
       },
       strict: true
+    },
+    %{
+      name: "Git",
+      description:
+        "Run one git subcommand in the working directory and return its output " <>
+          "(stdout and stderr, truncated to 50,000 characters) followed by the exit code. " <>
+          "Allowed subcommands: " <>
+          Enum.join(@git_subcommands, ", ") <>
+          ". Search history with log, e.g. args [\"--oneline\", \"--grep=cache\"] for " <>
+          "commit messages, [\"-S\", \"text\"] for commits that added or removed text, or " <>
+          "[\"-G\", \"regex\"]; then show <sha> to see one. Commit with args " <>
+          "[\"-m\", \"message\"]; there is no editor. stash allows push, list, show, pop and " <>
+          "apply. Refused: commit --amend and --no-verify, add --force, stash drop and " <>
+          "clear, interactive or editor flags, --output and --ext-diff.",
+      input_schema: %{
+        type: "object",
+        properties: %{
+          subcommand: %{type: "string", enum: @git_subcommands},
+          args: %{
+            type: "array",
+            items: %{type: "string"},
+            description: "Arguments after the subcommand, one per element (may be empty)"
+          }
+        },
+        required: ["subcommand", "args"],
+        additionalProperties: false
+      },
+      strict: true
     }
   ]
 
@@ -201,7 +273,8 @@ defmodule Go do
     and Grep that file instead of reading it whole.
 
     After changing Elixir code, run Mix compile and Mix test to verify it rather
-    than assuming it works. If a tool you would need does not exist, say so instead
+    than assuming it works. Use Git freely to inspect and search history, but only
+    add, commit or stash when the user asks; check Git status and diff first. If a tool you would need does not exist, say so instead
     of guessing. Changes to this harness's own code take effect only in the next
     session.
 
@@ -920,7 +993,69 @@ defmodule Go do
     {output, exit_code != 0}
   end
 
+  def execute_tool("Git", %{"subcommand" => subcommand, "args" => args}) when is_list(args) do
+    case git_refusal(subcommand, args) do
+      nil ->
+        # No shell, and the subcommand is always the first argument, so the
+        # model can't add git's global options (-c, --git-dir) in front of it.
+        # GIT_EDITOR=true makes anything that would open an editor carry on
+        # (or fail) instead of waiting forever; the pager is turned off too.
+        {out, exit_code} =
+          System.cmd("git", [subcommand | args],
+            stderr_to_stdout: true,
+            env: [{"GIT_EDITOR", "true"}, {"GIT_PAGER", "cat"}, {"GIT_TERMINAL_PROMPT", "0"}]
+          )
+
+        {truncate(out) <> "\n\n(exit #{exit_code})", exit_code != 0}
+
+      reason ->
+        {"Git refused: #{reason}", true}
+    end
+  end
+
   def execute_tool(name, _input), do: {"Unknown tool: #{name}", true}
+
+  @doc """
+  Why the Git tool won't run `git <subcommand> <args>`, or `nil` if it will.
+
+  Checks the subcommand against `@git_subcommands`, `git stash`'s action
+  against `@git_stash_actions`, and every flag against `@git_blocked_flags`.
+  Bundled short flags count separately (`-fA` contains `-f`), a long flag
+  matches with or without `=value`, and nothing after `--` is checked,
+  because git treats it as a path.
+  """
+  def git_refusal(subcommand, _args) when subcommand not in @git_subcommands,
+    do:
+      "subcommand #{inspect(subcommand)} is not allowed (allowed: #{Enum.join(@git_subcommands, ", ")})"
+
+  def git_refusal("stash", [action | _]) when action not in @git_stash_actions,
+    do:
+      if(String.starts_with?(action, "-"),
+        do: git_refused_flag("stash", ["push", action]),
+        else:
+          "git stash #{action} is not allowed (allowed: #{Enum.join(@git_stash_actions, ", ")})"
+      )
+
+  def git_refusal(subcommand, args), do: git_refused_flag(subcommand, args)
+
+  defp git_refused_flag(subcommand, args) do
+    blocked = Map.get(@git_blocked_flags, subcommand, []) ++ @git_blocked_flags[:all]
+    flags = args |> Enum.take_while(&(&1 != "--")) |> Enum.flat_map(&flag_names/1)
+
+    Enum.find_value(blocked, fn {flag, reason} ->
+      if flag in flags, do: "git #{subcommand} #{flag} is not allowed: it #{reason}"
+    end)
+  end
+
+  # The flag names in one argument: "--output=x" -> ["--output"],
+  # "-fA" -> ["-f", "-A"], anything that isn't a flag -> [].
+  defp flag_names("--" <> _ = arg), do: [arg |> String.split("=", parts: 2) |> hd()]
+
+  defp flag_names("-" <> letters) do
+    if letters =~ ~r/\A[a-zA-Z]+\z/, do: for(<<c <- letters>>, do: "-" <> <<c>>), else: []
+  end
+
+  defp flag_names(_), do: []
 
   # Emits "file:line:text" per matching line, or one entry per match with -o.
   defp grep_lines(file, text, regex, only_matching?) do

@@ -368,7 +368,7 @@ defmodule GoTest do
     ]
 
     defp run_stream(body, chunk_size) do
-      chunks = for <<chunk::binary-size(chunk_size) <- body>>, do: chunk
+      chunks = for <<chunk::binary-size(^chunk_size) <- body>>, do: chunk
       tail = binary_part(body, length(chunks) * chunk_size, rem(byte_size(body), chunk_size))
 
       {stream, printed} =
@@ -456,6 +456,72 @@ defmodule GoTest do
         |> List.insert_at(7, delta(1, %{"type" => "citations_delta", "citation" => %{}}))
 
       assert run_stream(sse(events), 1000) == run_stream(sse(@reply), 1000)
+    end
+  end
+
+  describe "Git tool" do
+    test "refuses subcommands, stash actions and flags outside the rules" do
+      refute Go.git_refusal("status", [])
+      refute Go.git_refusal("commit", ["-am", "fix the -n bug"])
+      refute Go.git_refusal("log", ["-n", "5", "--grep=cache"])
+      refute Go.git_refusal("stash", [])
+      refute Go.git_refusal("stash", ["pop"])
+      refute Go.git_refusal("add", ["--", "--force"])
+
+      assert Go.git_refusal("push", []) =~ "subcommand \"push\" is not allowed"
+      assert Go.git_refusal("reset", ["--hard"]) =~ "not allowed"
+      assert Go.git_refusal("commit", ["--amend", "-m", "x"]) =~ "rewrites the last commit"
+
+      assert Go.git_refusal("commit", ["--no-verify", "-m", "x"]) =~
+               "skips the repo's commit hooks"
+
+      assert Go.git_refusal("commit", ["-nm", "x"]) =~ "-n is not allowed"
+      assert Go.git_refusal("add", ["-fA"]) =~ "add -f is not allowed"
+      assert Go.git_refusal("add", ["-p"]) =~ "needs a terminal"
+      assert Go.git_refusal("log", ["--output=/tmp/x"]) =~ "writes output to a file"
+      assert Go.git_refusal("diff", ["--ext-diff"]) =~ "external diff program"
+      assert Go.git_refusal("stash", ["drop"]) =~ "git stash drop is not allowed"
+      assert Go.git_refusal("stash", ["clear"]) =~ "git stash clear is not allowed"
+      assert Go.git_refusal("stash", ["-p"]) =~ "needs a terminal"
+    end
+
+    @tag :tmp_dir
+    test "commits, searches history and stashes in a real repo", %{tmp_dir: dir} do
+      git = fn subcommand, args ->
+        Go.execute_tool("Git", %{"subcommand" => subcommand, "args" => args})
+      end
+
+      File.cd!(dir, fn ->
+        {_, 0} = System.cmd("git", ["init", "-q"])
+        {_, 0} = System.cmd("git", ["config", "user.email", "test@example.com"])
+        {_, 0} = System.cmd("git", ["config", "user.name", "Test"])
+
+        File.write!("a.txt", "hello cache\n")
+        assert {_, false} = git.("add", ["a.txt"])
+        assert {out, false} = git.("commit", ["-m", "Add caching notes"])
+        assert out =~ "Add caching notes"
+
+        assert {out, false} = git.("log", ["--oneline", "--grep=caching"])
+        assert out =~ "Add caching notes"
+        assert {out, false} = git.("log", ["--oneline", "-S", "hello cache"])
+        assert out =~ "Add caching notes"
+
+        File.write!("a.txt", "changed\n")
+        assert {_, false} = git.("stash", [])
+        assert File.read!("a.txt") == "hello cache\n"
+        assert {out, false} = git.("stash", ["list"])
+        assert out =~ "stash@{0}"
+
+        assert {"Git refused: " <> _, true} = git.("stash", ["drop"])
+        assert {out, false} = git.("stash", ["list"])
+        assert out =~ "stash@{0}"
+
+        # Without -m git would open an editor; GIT_EDITOR=true makes it give up instead.
+        File.write!("b.txt", "b\n")
+        {_, false} = git.("add", ["b.txt"])
+        assert {out, true} = git.("commit", [])
+        assert out =~ "(exit 1)"
+      end)
     end
   end
 end
