@@ -1,17 +1,335 @@
 # go
 
-A tiny single-file agent harness over the Claude Messages API, written to
-learn how a model and a harness fit together. Needs Elixir and `curl`; Req
-is pulled in by `Mix.install` on first run.
+A small coding agent in one Elixir file, written to learn how a model and a
+harness work together. `harness.exs` sends your prompt to Claude, runs the
+tools the model asks for on your machine, sends the results back, and repeats
+until the model has an answer. The loop is a handful of short functions, and
+it prints every step as it runs.
 
 ```zsh
-source .env                              # API_KEY, optional API_MODEL
-elixir harness.exs                       # prompts at >
-elixir harness.exs "your prompt here"
-elixir harness.exs --debug "your prompt" # print every full request
-elixir harness_test.exs                  # unit tests, no API calls
+source .env                               # API_KEY=..., optional API_MODEL=...
+elixir harness.exs "Grep harness.exs for the line defining @max_output and tell me its value in one line."
 ```
 
-Tools: Read, Write, Edit, Grep, WebFetch, Curl (native curl, no shell) and
-Mix (deps.get, compile, test, format). If the working directory has an
-`AGENTS.md`, it is put in front of the first prompt.
+```text
+[turn 1] stop_reason=tool_use | prompt 2105 tokens (cache read 0, cache write 2101, uncached 4) | output 103 tokens
+-> Grep %{"max_results" => 5, "path" => "@max_output", "pattern" => "@max_output"}
+<- error, 38 chars: No such file or directory: @max_output
+[turn 2] stop_reason=tool_use | prompt 2226 tokens (cache read 2101, cache write 123, uncached 2) | output 163 tokens
+-> Grep %{"max_results" => 5, "path" => "harness.exs", "pattern" => "@max_output"}
+<- ok, 341 chars: harness.exs:160:  @max_output 50_000
+`@max_output` is set to `50_000` on line 160 of harness.exs.
+[turn 3] stop_reason=end_turn | prompt 2533 tokens (cache read 2224, cache write 307, uncached 2) | output 28 tokens
+
+>
+```
+
+This one prompt took three requests. The model's first Grep used the wrong
+path and got an error back. It fixed the path, found the line, then answered
+without asking for a tool, which ended its turn (`end_turn`). The harness is
+now waiting at `>` for your next message.
+
+## Contents
+
+- [Running it](#running-it)
+- [Features](#features)
+- [From prompt to reply](#from-prompt-to-reply)
+- [How the agent decides to stop](#how-the-agent-decides-to-stop)
+- [What the model sees](#what-the-model-sees)
+- [Tools](#tools)
+- [Reading the output](#reading-the-output)
+- [Prompt caching](#prompt-caching)
+- [Safety](#safety)
+- [Code map](#code-map)
+- [Tests](#tests)
+- [Limitations](#limitations)
+
+## Running it
+
+You need Elixir and Erlang (versions in `.tool-versions`), `curl`, and an
+Anthropic API key. Req, the HTTP client, is the only dependency. `Mix.install`
+downloads it on the first run and caches it after that. There is no mix
+project to set up.
+
+Put your settings in `.env`, which git ignores:
+
+```zsh
+export API_KEY=sk-ant-...
+export API_MODEL=claude-haiku-5-5   # optional; this is the default
+```
+
+Then:
+
+```zsh
+source .env
+elixir harness.exs                        # asks for a prompt at >
+elixir harness.exs "your prompt here"     # starts with this prompt
+elixir harness.exs --debug "your prompt"  # also prints every full request
+elixir harness_test.exs                   # unit tests (no API calls)
+```
+
+The agent works in the directory you run it from. To use it on another
+project, `cd` there and run `elixir /path/to/harness.exs`.
+
+At the `>` prompt you can keep talking: each message continues the same
+conversation. Type `exit` or `quit`, or press Ctrl-D, to end the session.
+The conversation is not saved after you exit.
+
+## Features
+
+- **A visible agent loop.** After every response it prints the turn number,
+  why the model stopped, and how many tokens the conversation now uses. Every
+  tool call prints its input and a one-line summary of its result.
+- **Seven tools:** Read, Write, Edit, Grep, WebFetch, Curl and Mix
+  ([details](#tools)). There is no shell tool, so the model can only do what
+  these tools allow.
+- **A system prompt** that tells the model what this harness is, which
+  directory it's in, which tools it has, and that there is no shell.
+- **AGENTS.md support.** If the working directory has an `AGENTS.md`, it is
+  put in front of your first message, so the project's rules apply for the
+  whole session.
+- **Prompt caching** on every request. The tools, the system prompt and the
+  conversation so far are read from cache instead of being processed again.
+- **Errors don't end the session.** If a tool fails, the model gets the error
+  message and can try again. If an API request fails, you see the error, the
+  conversation is kept, and Enter retries the request.
+- **Output limits.** Every tool result is cut at 50,000 characters, with a
+  note saying so, so one large file or web page can't fill the context.
+- **`--debug`** prints the complete JSON of every request, so you can see
+  exactly what the model receives.
+- **One file.** `harness.exs` is the whole program. `harness_test.exs` holds
+  its tests.
+
+## From prompt to reply
+
+```text
+  you type a prompt
+        │
+        ▼
+  messages = [user: AGENTS.md (if any) + your prompt]
+        │
+        ▼
+ ┌─► call_model(messages) ── POST /v1/messages with tools + system + all messages
+ │      │
+ │      ▼
+ │   append the assistant's reply to messages
+ │      │
+ │      ▼
+ │   stop_reason == "tool_use"?
+ │      │yes                                  │no
+ │      ▼                                     ▼
+ │   run_tools: run each tool call,        print the reply, wait at >
+ │   append the results as one            (exit / quit / Ctrl-D ends it)
+ │   user message                               │
+ │      │                                       │ you type the next message
+ └──────┴───────────────────────────────────────┘ (appended to messages)
+```
+
+Step by step, using the function names in `harness.exs`:
+
+1. **`run/1`** takes your prompt. If it is blank, it asks for one at `>`.
+   It builds the first user message with **`first_message/2`**, which adds
+   `AGENTS.md` if there is one, and starts the loop.
+2. **`loop/2`** runs once per request to the model. It calls
+   **`call_model/1`**, which uses **`request_body/2`** to build the request.
+   That is the model name, `max_tokens`, the system prompt, the seven tool
+   definitions, and the *entire* conversation so far. The model has no memory
+   between requests; the conversation in `messages` is its only memory, and
+   every request sends all of it.
+3. The response is a list of content blocks. **Text** blocks are what the
+   model says to you. **`tool_use`** blocks are requests to run a tool, each
+   with a tool name, an input that matches that tool's schema, and an id.
+   **Thinking** blocks are the model's own reasoning. The harness prints the
+   text and adds the whole reply, unchanged, to `messages`.
+4. If the model asked for tools, **`run_tools/1`** runs each `tool_use`
+   block in order through **`execute_tool/2`**. It collects one
+   `tool_result` per call, with the same id and an `is_error` flag. All the
+   results go back as a single user message, and the loop sends the
+   conversation again. The model then reads the results and either asks for
+   more tools or answers.
+5. When the model stops asking for tools, its turn is over.
+   **`next_prompt/2`** waits for your next message at `>`
+   (**`read_user_input/0`**), adds it to `messages`, and the loop continues.
+
+A single prompt can lead to many requests. "Fix the failing test" might be
+Read, Edit, Mix test, Edit, Mix test, then a final answer: six requests in one
+turn, each a little bigger than the last.
+
+## How the agent decides to stop
+
+**The model decides, not the harness.** The harness never looks at what the
+model wrote to judge whether the task is done. It only reads the
+`stop_reason` field that the API returns with every response:
+
+| `stop_reason` | What it means | What the harness does |
+|---|---|---|
+| `tool_use` | The model asked for one or more tools and is waiting for the results | Run them, send the results, call the model again |
+| `end_turn` | The model finished its answer | Wait for your next message at `>` |
+| `max_tokens` | The reply hit the 16,000-token output limit | Treat it as the end of the turn (see [Limitations](#limitations)) |
+| anything else (e.g. `refusal`) | The model stopped for another reason | Treat it as the end of the turn |
+
+The whole decision is one line in `loop/2`:
+
+```elixir
+if response["stop_reason"] == "tool_use" do
+```
+
+So the model keeps working for as long as it keeps calling tools. When it
+thinks it has what it needs, it writes a reply without a tool call, the API
+reports `end_turn`, and control comes back to you. Nothing in the harness
+limits the number of tool calls in a turn. The model's own judgement and the
+system prompt's guidance (verify changes with Mix, say so if a tool is
+missing) shape when it stops.
+
+The *session* ends only when you say so: `exit`, `quit`, Ctrl-D, or `exit` at
+the retry prompt after an API error.
+
+## What the model sees
+
+Every request has the same four parts, in this order:
+
+1. **Tools**: the seven tool definitions in `@tools`. Each has a name, a
+   description that tells the model when and how to use it, and a JSON input
+   schema. `strict: true` makes the API guarantee that tool inputs match the
+   schema.
+2. **System prompt** (`system_prompt/1`): what this harness is, the working
+   directory, the tool names (built from `@tools` so the two can't drift),
+   that there is no shell, to verify code changes with Mix, and to keep
+   replies short.
+3. **First user message** (`first_message/2`): the contents of `AGENTS.md`
+   wrapped in `<project_instructions>`, if the file exists, followed by your
+   prompt.
+4. **The rest of the conversation**: every reply, tool call, tool result and
+   message since then, in order.
+
+Run with `--debug` to see the full request for every turn.
+
+## Tools
+
+| Tool | What it does | Limits |
+|---|---|---|
+| **Read** | Returns a file's contents | Cut at 50,000 characters |
+| **Write** | Creates or overwrites a file, creating folders as needed | |
+| **Edit** | Replaces one exact occurrence of `old_string` with `new_string` | `old_string` must not be empty and must appear exactly once |
+| **Grep** | Regex search of a file or folder, returning `file:line:text` | Optional `only_matching`, `case_insensitive`, `max_results` (default 100). Folder searches skip `_build`, `deps`, `node_modules` and hidden folders |
+| **WebFetch** | Plain HTTP GET of a URL | 30-second timeout, body cut at 50,000 characters |
+| **Curl** | Runs the real `curl` with an array of arguments, for headers, cookies, methods and request bodies | Adds `--silent --show-error --max-time 60` and reports the HTTP status and exit code. Output cut at 50,000 characters |
+| **Mix** | Runs one mix task in the working directory | Only `deps.get`, `compile`, `test` and `format`, with no extra arguments |
+
+Without a shell, the model can't pipe output between programs. To search a
+large web page it saves the page with `Curl -o page.html`, then runs `Grep`
+on the file. The system prompt and the Curl description both point it to
+this approach.
+
+When a tool fails, for example because a file is missing or an Edit
+`old_string` isn't found, the error message goes back to the model as a
+result with `is_error: true`. Models usually fix their call and try again;
+the example at the top of this README shows this happening.
+
+To add a tool: add its definition to `@tools` and add an `execute_tool/2`
+clause with the same name that returns `{output, is_error}`. The system
+prompt picks up the new name automatically.
+
+## Reading the output
+
+```text
+[turn 2] stop_reason=tool_use | prompt 2226 tokens (cache read 2101, cache write 123, uncached 2) | output 163 tokens
+-> Grep %{"path" => "harness.exs", "pattern" => "@max_output"}
+<- ok, 341 chars: harness.exs:160:  @max_output 50_000
+```
+
+- **`[turn N]`** counts requests to the model in this session, not your
+  messages.
+- **`stop_reason`** is what the loop acts on ([above](#how-the-agent-decides-to-stop)).
+- **`prompt N tokens`** is the size of the whole request: cache read plus
+  cache write plus uncached. Watching it grow turn by turn shows how an
+  agent's context fills up.
+- **`output N tokens`** is what the model generated: its text, tool calls
+  and thinking.
+- **`->`** is a tool call and its input (long strings are shortened on
+  screen only).
+- **`<-`** is the result: `ok` or `error`, its length, and the start of its
+  first line. The model always receives the full result.
+
+## Prompt caching
+
+Every request repeats everything that came before it, so without caching the
+API would process the same tokens again and again. `request_body/2` sets two
+cache breakpoints:
+
+1. **On the system prompt.** The API orders a request as tools, then system,
+   then messages, so this breakpoint caches the tools and system prompt
+   together. They are the same for every request and every session in the
+   same folder.
+2. **Automatic, at the end of the conversation** (the top-level
+   `cache_control`). The API places it on the last block and moves it as the
+   conversation grows, so each request reads the previous request from cache
+   and only pays full price for what is new.
+
+In the example above, turn 2 read 2,101 tokens from cache and processed only
+125 new ones. Cache entries last 5 minutes from their last use. Anything that
+changes the cached bytes, such as a different tool list, system prompt or
+model, causes a miss.
+
+## Safety
+
+This is a learning tool, not a sandbox.
+
+- **Tools run with your permissions, and nothing asks you first.** Write and
+  Edit can change any file you can change, and Read can read any file you can
+  read, including outside the working directory.
+- **There is no shell.** Curl and Mix call their programs directly with an
+  argument list, so an argument like `"x; rm -rf ~"` is passed as text and
+  never run as a command. Mix only accepts its four allowed tasks.
+- **Curl and WebFetch can reach any URL.** The model can send what it reads
+  (files, `.env`) to the network if it decides to.
+- **AGENTS.md is followed as your instructions.** Only run the agent in
+  projects whose `AGENTS.md` you trust.
+- **`--debug` prints everything,** including file contents and any cookies
+  or tokens passed to Curl. Don't share that output.
+
+## Code map
+
+`harness.exs`, top to bottom:
+
+| Part | What it is |
+|---|---|
+| `Mix.install([{:req, "0.7.5"}])` | The single dependency, pinned so every install is the same |
+| `@mix_tasks`, `@tools` | The Mix allowlist and the seven tool definitions sent to the API |
+| `@max_output`, `@grep_skip_dirs` | The 50,000-character output limit and the folders Grep skips |
+| `system_prompt/1`, `first_message/2`, `request_body/2` | What goes into each request |
+| `run/1`, `loop/2`, `next_prompt/2` | The agent loop |
+| `call_model/1` | One HTTP request to the Messages API; returns `{:ok, _}` or `{:error, _}` |
+| `print_response/2`, `turn_status/3`, `run_tools/1`, `result_summary/2` | Running tools and printing what happens |
+| `read_user_input/0` | The `>` prompt |
+| `execute_tool/2` | One clause per tool |
+| `truncate/1`, `files_under/1`, `grep_lines/4` | Helpers for the tools |
+| Entry point (bottom of file) | Parses `--debug` and calls `Go.run/1`; skipped when the tests load the file |
+
+## Tests
+
+```zsh
+elixir harness_test.exs
+```
+
+The tests load `harness.exs` without starting a session and check the tools,
+the system prompt, AGENTS.md loading, the cache settings, input handling and
+the status line. None of them call the API. The script exits with a non-zero
+status if any test fails, so it works in CI or a git hook.
+
+## Limitations
+
+- **No compaction.** The conversation only grows. A very long session will
+  eventually hit the model's context limit; exit and start a new one.
+- **`max_tokens` during a tool call.** If a reply is cut off at 16,000 output
+  tokens partway through a tool call, the harness treats it as the end of the
+  turn, and the next request is likely to fail. The status line shows
+  `stop_reason=max_tokens` when this happens.
+- **No streaming.** Each reply appears all at once when it's complete.
+- **Tools run one at a time,** even when the model asks for several at once.
+- **Read has no offset.** Large files are cut at 50,000 characters; use Grep
+  to find the part you need.
+- **Nothing is saved.** History is lost when you exit, and a crash (for
+  example Ctrl-C) loses it too.
+- **Code changes need a restart.** If the agent edits `harness.exs`, the
+  change takes effect in the next session.
