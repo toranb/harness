@@ -163,8 +163,14 @@ defmodule Go do
   # dependencies are large and rarely what you're looking for.
   @grep_skip_dirs ~w(_build deps node_modules)
 
-  # Shown for an unknown slash command.
-  @commands_help "Commands: /compact [focus] summarizes the conversation to free up context; exit quits."
+  # What you can type at the > prompt besides a message, as shown by /help.
+  # To add a command, add it here and handle it in next_prompt/2 (and in
+  # start/1 if it should work before the first message).
+  @commands [
+    {"/help", "list these commands"},
+    {"/compact [focus]", "summarize the conversation to free up context (optional focus)"},
+    {"exit, quit, Ctrl-D", "end the session"}
+  ]
 
   # The status line suggests /compact once a prompt is this big. It is only
   # a hint: nothing compacts until you type the command.
@@ -280,16 +286,26 @@ defmodule Go do
     start(parse_input(prompt))
   end
 
-  # Before the first message there is nothing to compact, so a command just
-  # asks again.
+  # Before the first message only /help does anything; other commands
+  # explain why not and ask again.
   defp start({:message, text}),
     do: loop([%{role: "user", content: first_message(text, File.cwd!())}], 1)
 
   defp start(:exit), do: :ok
   defp start(:blank), do: start(read_user_input())
 
+  defp start({:command, "help", _}) do
+    IO.puts(help_text())
+    start(read_user_input())
+  end
+
+  defp start({:command, "compact", _}) do
+    IO.puts("/compact needs a conversation first; send a message.")
+    start(read_user_input())
+  end
+
   defp start({:command, name, _}) do
-    IO.puts("/#{name} needs a conversation first; send a message.")
+    IO.puts(unknown_command(name))
     start(read_user_input())
   end
 
@@ -336,14 +352,34 @@ defmodule Go do
             next_prompt(messages, turn + 1)
         end
 
+      {:command, "help", _} ->
+        IO.puts(help_text())
+        next_prompt(messages, turn)
+
       {:command, name, _} ->
-        IO.puts("Unknown command /#{name}. #{@commands_help}")
+        IO.puts(unknown_command(name))
         next_prompt(messages, turn)
 
       :exit ->
         :ok
     end
   end
+
+  @doc """
+  The `/help` output: one line per entry in `@commands`, aligned. Anything
+  else typed at `>` is sent to the model as a message.
+  """
+  def help_text do
+    width = @commands |> Enum.map(fn {usage, _} -> String.length(usage) end) |> Enum.max()
+
+    lines =
+      for {usage, description} <- @commands,
+          do: "  #{String.pad_trailing(usage, width)}  #{description}"
+
+    Enum.join(["Commands:" | lines] ++ ["Anything else you type is sent to the model."], "\n")
+  end
+
+  defp unknown_command(name), do: "Unknown command /#{name}. Type /help for the list."
 
   @doc """
   Adds the user's text to the conversation.

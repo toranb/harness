@@ -230,6 +230,18 @@ defmodule GoTest do
       assert_received {:result, :ok}
     end
 
+    test "/help lists every command and works before the first message" do
+      output = capture_io("/help\n/nope\nexit\n", fn -> send(self(), {:result, Go.run("")}) end)
+
+      assert output =~ Go.help_text()
+      assert output =~ "Unknown command /nope. Type /help for the list."
+      assert_received {:result, :ok}
+
+      for usage <- ["/help", "/compact [focus]", "exit, quit, Ctrl-D"] do
+        assert Go.help_text() =~ usage
+      end
+    end
+
     test "add_user_text starts a new turn, or joins the summary right after /compact" do
       normal = [%{role: "user", content: "hi"}, %{role: "assistant", content: []}]
       assert Go.add_user_text(normal, "next") == normal ++ [%{role: "user", content: "next"}]

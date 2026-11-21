@@ -74,9 +74,22 @@ The agent works in the directory you run it from. To use it on another
 project, `cd` there and run `elixir /path/to/harness.exs`.
 
 At the `>` prompt you can keep talking: each message continues the same
-conversation. Type `/compact` to shrink a long conversation into a summary
-([details](#compaction-compact)). Type `exit` or `quit`, or press Ctrl-D, to
-end the session. The conversation is not saved after you exit.
+conversation. A few inputs are commands instead of messages:
+
+```text
+Commands:
+  /help               list these commands
+  /compact [focus]    summarize the conversation to free up context (optional focus)
+  exit, quit, Ctrl-D  end the session
+Anything else you type is sent to the model.
+```
+
+That is the output of `/help`, which also works before your first message.
+An unknown command such as `/foo` says so and points you to `/help`. Only a
+slash followed by letters counts as a command, so a message starting with a
+path like `/home/me/app` still goes to the model. See
+[Compaction](#compaction-compact) for what `/compact` does. The conversation
+is not saved after you exit.
 
 ## Features
 
@@ -420,6 +433,7 @@ This is a learning tool, not a sandbox.
 | `call_model/2` | One streamed request to the Messages API; returns `{:ok, response}` or `{:error, reason}` |
 | `new_stream/0`, `consume_chunk/2`, `apply_event/2`, `finish_stream/1` | Rebuilding the response from the streamed events |
 | `turn_status/3`, `run_tools/1`, `result_summary/2` | Running tools and printing what happens |
+| `@commands`, `help_text/0` | The commands `/help` lists; add a new one here and in `next_prompt/2` |
 | `read_user_input/0`, `parse_input/1` | The `>` prompt: messages, `/commands` and `exit` |
 | `compact/3`, `compaction_prompt/1`, `extract_summary/1`, `compacted_messages/2` | `/compact` |
 | `execute_tool/2` | One clause per tool |
