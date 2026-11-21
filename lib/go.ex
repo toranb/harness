@@ -1,7 +1,8 @@
 defmodule Go do
   @moduledoc """
   A bare-bones agent loop over the Claude Messages API with three
-  client-side tools that mirror Claude Code's: Read, Write and WebFetch.
+  client-side tools that mirror Claude Code's: Read, Write, Edit, WebFetch,
+  plus Curl, which shells out to the native `curl` binary.
   """
 
   @tools [
@@ -18,7 +19,8 @@ defmodule Go do
     },
     %{
       name: "Write",
-      description: "Write content to a file on the local filesystem, overwriting it if it exists.",
+      description:
+        "Write content to a file on the local filesystem, overwriting it if it exists.",
       input_schema: %{
         type: "object",
         properties: %{
@@ -57,6 +59,30 @@ defmodule Go do
         type: "object",
         properties: %{url: %{type: "string", description: "Fully qualified http(s) URL to fetch"}},
         required: ["url"],
+        additionalProperties: false
+      },
+      strict: true
+    },
+    %{
+      name: "Curl",
+      description:
+        "Run the native `curl` command with the given arguments and return its output " <>
+          "(stdout and stderr, truncated to 50,000 characters) followed by the HTTP status. " <>
+          "Use this instead of WebFetch when you need custom headers, cookies, methods or a " <>
+          "request body. Pass each argument as its own array element exactly as the shell " <>
+          "would after removing quotes and line continuations, e.g. " <>
+          ~s|["https://example.com", "-H", "accept: text/html", "-b", "a=1; b=2"]. | <>
+          "No shell is involved, so pipes, redirects and variables do not work.",
+      input_schema: %{
+        type: "object",
+        properties: %{
+          args: %{
+            type: "array",
+            items: %{type: "string"},
+            description: "Arguments passed to curl (do not include the word curl itself)"
+          }
+        },
+        required: ["args"],
         additionalProperties: false
       },
       strict: true
@@ -118,34 +144,7 @@ defmodule Go do
 
             {output, error?} =
               try do
-                case {name, input} do
-                  {"Read", %{"file_path" => path}} ->
-                    {File.read!(path), false}
-
-                  {"Write", %{"file_path" => path, "content" => body}} ->
-                    File.mkdir_p!(Path.dirname(path))
-                    File.write!(path, body)
-                    {"Wrote #{byte_size(body)} bytes to #{path}", false}
-
-                  {"Edit", %{"file_path" => path, "old_string" => old, "new_string" => new}} ->
-                    text = File.read!(path)
-
-                    case length(:binary.matches(text, old)) do
-                      _ when old == "" -> raise "old_string must not be empty"
-                      0 -> raise "old_string not found in #{path}"
-                      1 -> File.write!(path, String.replace(text, old, new, global: false))
-                      n -> raise "old_string matches #{n} times in #{path}; include more context"
-                    end
-
-                    {"Edited #{path}", false}
-
-                  {"WebFetch", %{"url" => url}} ->
-                    r = Req.get!(url, decode_body: false, receive_timeout: 30_000)
-                    {"HTTP #{r.status}\n\n" <> String.slice(to_string(r.body), 0, 50_000), false}
-
-                  _ ->
-                    {"Unknown tool: #{name}", true}
-                end
+                execute_tool(name, input)
               rescue
                 e -> {Exception.message(e), true}
               end
@@ -169,4 +168,59 @@ defmodule Go do
         raise "Agent stopped with stop_reason=#{other}"
     end
   end
+
+  @doc false
+  # Runs one tool call. Returns {output, is_error}.
+  def execute_tool("Read", %{"file_path" => path}), do: {File.read!(path), false}
+
+  def execute_tool("Write", %{"file_path" => path, "content" => body}) do
+    File.mkdir_p!(Path.dirname(path))
+    File.write!(path, body)
+    {"Wrote #{byte_size(body)} bytes to #{path}", false}
+  end
+
+  def execute_tool("Edit", %{"file_path" => path, "old_string" => old, "new_string" => new}) do
+    text = File.read!(path)
+
+    case length(:binary.matches(text, old)) do
+      _ when old == "" -> raise "old_string must not be empty"
+      0 -> raise "old_string not found in #{path}"
+      1 -> File.write!(path, String.replace(text, old, new, global: false))
+      n -> raise "old_string matches #{n} times in #{path}; include more context"
+    end
+
+    {"Edited #{path}", false}
+  end
+
+  def execute_tool("WebFetch", %{"url" => url}) do
+    r = Req.get!(url, decode_body: false, receive_timeout: 30_000)
+    {"HTTP #{r.status}\n\n" <> String.slice(to_string(r.body), 0, 50_000), false}
+  end
+
+  def execute_tool("Curl", %{"args" => args}) when is_list(args) do
+    # Args go straight to the curl binary (no shell), so nothing the model
+    # passes can be interpreted as a pipe, redirect or second command.
+    # Our defaults come first so the model's own flags win if repeated;
+    # --write-out is last so the status line is always ours.
+    {out, exit_code} =
+      System.cmd(
+        "curl",
+        ["--silent", "--show-error", "--max-time", "60"] ++
+          args ++ ["--write-out", "\n[curl] HTTP %{http_code}"],
+        stderr_to_stdout: true
+      )
+
+    # Peel off the trailing status line we appended (anchored to the end, so
+    # a response body that happens to contain "[curl] HTTP" can't fool it).
+    {body, status_line} =
+      case Regex.run(~r/\A(.*)\n\[curl\] (HTTP \d{3})\z/s, out) do
+        [_, body, status] -> {body, status}
+        nil -> {out, "HTTP ???"}
+      end
+
+    output = String.slice(body, 0, 50_000) <> "\n\n" <> status_line <> " (exit #{exit_code})"
+    {output, exit_code != 0}
+  end
+
+  def execute_tool(name, _input), do: {"Unknown tool: #{name}", true}
 end
