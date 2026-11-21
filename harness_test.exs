@@ -1,3 +1,11 @@
+# Unit tests for harness.exs. Run with: elixir harness_test.exs
+# None of these call the Claude API.
+
+Application.put_env(:go, :no_main, true)
+Code.require_file("harness.exs", __DIR__)
+
+ExUnit.start()
+
 defmodule GoTest do
   use ExUnit.Case
 
@@ -98,20 +106,6 @@ defmodule GoTest do
       assert message =~ ~s(<project_instructions source="AGENTS.md">)
       assert message =~ "# Rules\nUse tabs.\n</project_instructions>"
       assert String.ends_with?(message, "</project_instructions>\n\nfix the bug")
-    end
-  end
-
-  describe "single-file harness.exs" do
-    test "embeds lib/go.ex and go.exs verbatim" do
-      script = File.read!("harness.exs")
-
-      assert script =~ "Mix.install([{:req,"
-
-      assert String.contains?(script, File.read!("lib/go.ex")),
-             "harness.exs is out of date with lib/go.ex; regenerate it"
-
-      assert String.contains?(script, File.read!("go.exs")),
-             "harness.exs is out of date with go.exs; regenerate it"
     end
   end
 end

@@ -1,26 +1,17 @@
-# Go
+# go
+
+A tiny single-file agent harness over the Claude Messages API, written to
+learn how a model and a harness fit together. Needs Elixir and `curl`; Req
+is pulled in by `Mix.install` on first run.
 
 ```zsh
-source .env
-mix run --no-start go.exs
-mix run --no-start go.exs --debug
-mix run --no-start go.exs "your prompt here"
+source .env                              # API_KEY, optional API_MODEL
+elixir harness.exs                       # prompts at >
+elixir harness.exs "your prompt here"
+elixir harness.exs --debug "your prompt" # print every full request
+elixir harness_test.exs                  # unit tests, no API calls
 ```
 
-## Installation
-
-If [available in Hex](https://hex.pm/docs/publish), the package can be installed
-by adding `go` to your list of dependencies in `mix.exs`:
-
-```elixir
-def deps do
-  [
-    {:go, "~> 0.1.0"}
-  ]
-end
-```
-
-Documentation can be generated with [ExDoc](https://github.com/elixir-lang/ex_doc)
-and published on [HexDocs](https://hexdocs.pm). Once published, the docs can
-be found at <https://hexdocs.pm/go>.
-
+Tools: Read, Write, Edit, Grep, WebFetch, Curl (native curl, no shell) and
+Mix (deps.get, compile, test, format). If the working directory has an
+`AGENTS.md`, it is put in front of the first prompt.

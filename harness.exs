@@ -1,14 +1,13 @@
-# Single-file version of the go harness: no mix project needed.
+# go: a tiny single-file agent harness over the Claude Messages API.
 #
 #   source .env
 #   elixir harness.exs                       # prompts at >
 #   elixir harness.exs "your prompt here"
 #   elixir harness.exs --debug "your prompt"
 #
-# The Go module below is a verbatim copy of lib/go.ex (a test checks they
-# stay in sync), followed by the same entry point as go.exs.
-
-Mix.install([{:req, "~> 0.5"}])
+# Tests: elixir harness_test.exs
+# Pinned so every fresh install resolves the same Req.
+Mix.install([{:req, "0.7.5"}])
 
 defmodule Go do
   @moduledoc """
@@ -413,18 +412,20 @@ defmodule Go do
   end
 end
 
-# Entry point (same as go.exs)
+# Entry point. harness_test.exs loads this file with :no_main set so it can
+# test the Go module without starting a session.
+unless Application.get_env(:go, :no_main, false) do
+  {opts, args, _} = OptionParser.parse(System.argv(), strict: [debug: :boolean])
+  Application.put_env(:go, :debug, Keyword.get(opts, :debug, false))
 
-{opts, args, _} = OptionParser.parse(System.argv(), strict: [debug: :boolean])
-Application.put_env(:go, :debug, Keyword.get(opts, :debug, false))
+  case args do
+    [] ->
+      case IO.gets("> ") do
+        prompt when is_binary(prompt) -> Go.run(String.trim(prompt))
+        _ -> :ok
+      end
 
-case args do
-  [] ->
-    case IO.gets("> ") do
-      prompt when is_binary(prompt) -> Go.run(String.trim(prompt))
-      _ -> :ok
-    end
-
-  args ->
-    Go.run(Enum.join(args, " "))
+    args ->
+      Go.run(Enum.join(args, " "))
+  end
 end
