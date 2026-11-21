@@ -280,8 +280,13 @@ defmodule Go do
     and Grep that file instead of reading it whole.
 
     After changing Elixir code, run Mix compile and Mix test to verify it rather
-    than assuming it works. Use Git freely to inspect and search history, but only
-    add, commit or stash when the user asks; check Git status and diff first.
+    than assuming it works.
+
+    Git only runs these subcommands: #{Enum.join(@git_subcommands, ", ")}.
+    Its stash only allows #{Enum.join(@git_stash_actions, ", ")}. It cannot talk to a remote,
+    reset, rebase or amend commits. Use it freely to inspect and search history,
+    but only add, commit or stash when the user asks; check Git status and diff
+    first.
 
     If a tool you would need does not exist, say so instead of guessing. Changes
     to this harness's own code take effect only in the next session.

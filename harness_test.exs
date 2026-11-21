@@ -91,6 +91,19 @@ defmodule GoTest do
       assert prompt =~ "Your only tools are\n#{names};"
     end
 
+    test "system prompt states the Git subset and wraps at 80 characters" do
+      prompt = Go.system_prompt("/some/project")
+
+      assert prompt =~
+               "Git only runs these subcommands: status, log, diff, show, add, commit, stash."
+
+      assert prompt =~ "Its stash only allows push, list, show, pop, apply."
+
+      for line <- String.split(prompt, "\n") do
+        assert String.length(line) <= 80, "system prompt line is too long: #{line}"
+      end
+    end
+
     @tag :tmp_dir
     test "first message is just the prompt when there is no AGENTS.md", %{tmp_dir: dir} do
       assert Go.first_message("hello", dir) == "hello"

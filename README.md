@@ -218,8 +218,10 @@ Every request has the same four parts, in this order:
    schema.
 2. **System prompt** (`system_prompt/1`): what this harness is, the working
    directory, the tool names (built from `@tools` so the two can't drift),
-   that there is no shell, to verify code changes with Mix, to only stage
-   or commit with Git when you ask, and to keep replies short.
+   that there is no shell, to verify code changes with Mix, which Git
+   subcommands and stash actions it has (built from `@git_subcommands` and
+   `@git_stash_actions`), to only stage or commit with Git when you ask, and
+   to keep replies short.
 3. **First user message** (`first_message/2`): the contents of `AGENTS.md`
    wrapped in `<project_instructions>`, if the file exists, followed by your
    prompt.
@@ -250,9 +252,12 @@ this approach.
 
 Git lets the agent search history and make local commits, but nothing that
 talks to a remote (`push`, `pull`, `fetch`) or rewrites history (`reset`,
-`rebase`, `commit --amend`). The system prompt tells the model to use it
-freely for reading, but to stage, commit or stash only when you ask, and to
-check `status` and `diff` first.
+`rebase`, `commit --amend`). The system prompt lists the subcommands and
+stash actions it has, generated from the same lists the tool checks, and
+says it can't talk to a remote, reset, rebase or amend. It tells the model
+to use Git freely for reading, but to stage, commit or stash only when you
+ask, and to check `status` and `diff` first. The Git tool's own description
+repeats the details, including the refused flags.
 
 Searching history uses `git log`:
 
