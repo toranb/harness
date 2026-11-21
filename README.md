@@ -39,6 +39,7 @@ now waiting at `>` for your next message.
 - [Tools](#tools)
 - [Reading the output](#reading-the-output)
 - [Prompt caching](#prompt-caching)
+- [Compaction (/compact)](#compaction-compact)
 - [Safety](#safety)
 - [Code map](#code-map)
 - [Tests](#tests)
@@ -72,8 +73,9 @@ The agent works in the directory you run it from. To use it on another
 project, `cd` there and run `elixir /path/to/harness.exs`.
 
 At the `>` prompt you can keep talking: each message continues the same
-conversation. Type `exit` or `quit`, or press Ctrl-D, to end the session.
-The conversation is not saved after you exit.
+conversation. Type `/compact` to shrink a long conversation into a summary
+([details](#compaction-compact)). Type `exit` or `quit`, or press Ctrl-D, to
+end the session. The conversation is not saved after you exit.
 
 ## Features
 
@@ -88,6 +90,8 @@ The conversation is not saved after you exit.
 - **AGENTS.md support.** If the working directory has an `AGENTS.md`, it is
   put in front of your first message, so the project's rules apply for the
   whole session.
+- **Manual compaction.** `/compact` replaces a long conversation with a
+  summary so the session can keep going. It only happens when you type it.
 - **Prompt caching** on every request. The tools, the system prompt and the
   conversation so far are read from cache instead of being processed again.
 - **Errors don't end the session.** If a tool fails, the model gets the error
@@ -148,8 +152,9 @@ Step by step, using the function names in `harness.exs`:
    conversation again. The model then reads the results and either asks for
    more tools or answers.
 5. When the model stops asking for tools, its turn is over.
-   **`next_prompt/2`** waits for your next message at `>`
-   (**`read_user_input/0`**), adds it to `messages`, and the loop continues.
+   **`next_prompt/2`** waits at `>` (**`read_user_input/0`**). A message is
+   added to `messages` and the loop continues; `/compact` replaces
+   `messages` with a summary first ([below](#compaction-compact)).
 
 A single prompt can lead to many requests. "Fix the failing test" might be
 Read, Edit, Mix test, Edit, Mix test, then a final answer: six requests in one
@@ -271,6 +276,56 @@ In the example above, turn 2 read 2,101 tokens from cache and processed only
 changes the cached bytes, such as a different tool list, system prompt or
 model, causes a miss.
 
+## Compaction (/compact)
+
+The conversation grows with every request, and every request sends all of
+it, so a long session eventually gets slow, expensive, and close to the
+model's context limit. `/compact` fixes that by replacing the conversation
+with a summary of it.
+
+```text
+> /compact
+> /compact keep the exact error messages     # optional: what to pay attention to
+```
+
+It only happens when you type the command. The status line suggests it once
+a prompt passes 150,000 tokens (`large context: /compact to shrink it`), but
+it never compacts on its own. You can only type it at `>`, between turns, so
+it never interrupts a tool call that is waiting for its result.
+
+What happens (`compact/3`):
+
+1. The harness sends the whole conversation plus one more message asking for
+   a summary (`compaction_prompt/1`). That prompt, suggested by Anthropic for
+   this purpose, lists what the summary must keep: problems hit and how they
+   were handled, decisions and constraints in your own words, where things
+   stand, what is still open, and exact names, numbers and wording. Anything
+   you type after `/compact` is added as extra focus. Because the
+   conversation is already cached, this request is cheap.
+2. It takes the text inside the reply's `<summary>` tags
+   (`extract_summary/1`) and prints it, so you can see exactly what the model
+   will remember.
+3. It starts a new conversation that holds only `AGENTS.md` (if there is one)
+   and the summary, marked as `<earlier_conversation_summary>`
+   (`compacted_messages/2`). Your next message is added to it.
+
+Nothing from before the summary is replayed: no earlier messages, tool
+results or thinking blocks. This is deliberate. Editing or trimming an old
+conversation that contains thinking blocks can be rejected by the API, while
+a fresh conversation that starts from a summary is always valid. The cost is
+that **the summary is all the model knows** about the earlier session, so
+read it, and if something important is missing, tell the model in your next
+message.
+
+In a test session, a conversation that had read the README went from an
+8,194-token prompt to 3,049 tokens after `/compact`. The model still
+answered questions about details from before the summary correctly. The
+tools and system prompt stay cached across a compaction; the conversation
+starts a new cache entry.
+
+If the summary request fails, for example because of an API error, the
+harness prints `[compact failed]` and the conversation is left unchanged.
+
 ## Safety
 
 This is a learning tool, not a sandbox.
@@ -298,10 +353,11 @@ This is a learning tool, not a sandbox.
 | `@mix_tasks`, `@tools` | The Mix allowlist and the seven tool definitions sent to the API |
 | `@max_output`, `@grep_skip_dirs` | The 50,000-character output limit and the folders Grep skips |
 | `system_prompt/1`, `first_message/2`, `request_body/2` | What goes into each request |
-| `run/1`, `loop/2`, `next_prompt/2` | The agent loop |
+| `run/1`, `start/1`, `loop/2`, `next_prompt/2`, `add_user_text/2` | The agent loop |
 | `call_model/1` | One HTTP request to the Messages API; returns `{:ok, _}` or `{:error, _}` |
 | `print_response/2`, `turn_status/3`, `run_tools/1`, `result_summary/2` | Running tools and printing what happens |
-| `read_user_input/0` | The `>` prompt |
+| `read_user_input/0`, `parse_input/1` | The `>` prompt: messages, `/commands` and `exit` |
+| `compact/3`, `compaction_prompt/1`, `extract_summary/1`, `compacted_messages/2` | `/compact` |
 | `execute_tool/2` | One clause per tool |
 | `truncate/1`, `files_under/1`, `grep_lines/4` | Helpers for the tools |
 | Entry point (bottom of file) | Parses `--debug` and calls `Go.run/1`; skipped when the tests load the file |
@@ -313,14 +369,16 @@ elixir harness_test.exs
 ```
 
 The tests load `harness.exs` without starting a session and check the tools,
-the system prompt, AGENTS.md loading, the cache settings, input handling and
+the system prompt, AGENTS.md loading, the cache settings, input and slash
+command parsing, the compaction steps (everything except the API call) and
 the status line. None of them call the API. The script exits with a non-zero
 status if any test fails, so it works in CI or a git hook.
 
 ## Limitations
 
-- **No compaction.** The conversation only grows. A very long session will
-  eventually hit the model's context limit; exit and start a new one.
+- **Compaction is manual.** If you never type `/compact`, a very long
+  session will eventually hit the model's context limit. A compacted session
+  only remembers what the summary kept.
 - **`max_tokens` during a tool call.** If a reply is cut off at 16,000 output
   tokens partway through a tool call, the harness treats it as the end of the
   turn, and the next request is likely to fail. The status line shows

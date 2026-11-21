@@ -173,13 +173,13 @@ defmodule GoTest do
           send(self(), {:result, Go.run("   ")})
         end)
 
-      assert_received {:result, :exit}
+      assert_received {:result, :ok}
       assert output =~ ">"
     end
 
     test "read_user_input returns text, or :exit on exit or Ctrl-D" do
       capture_io("\nhello\n", fn -> send(self(), Go.read_user_input()) end)
-      assert_received {:ok, "hello"}
+      assert_received {:message, "hello"}
 
       capture_io("quit\n", fn -> send(self(), Go.read_user_input()) end)
       assert_received :exit
@@ -206,6 +206,80 @@ defmodule GoTest do
     test "result summary shows status, size and the start of the first line" do
       assert Go.result_summary("line one\nline two", false) == "ok, 17 chars: line one"
       assert Go.result_summary("boom", true) == "error, 4 chars: boom"
+    end
+  end
+
+  describe "input and slash commands" do
+    test "parse_input tells messages, commands, blanks and exit apart" do
+      assert Go.parse_input("  \n") == :blank
+      assert Go.parse_input("quit\n") == :exit
+      assert Go.parse_input("fix the bug\n") == {:message, "fix the bug"}
+      assert Go.parse_input("/compact\n") == {:command, "compact", ""}
+
+      assert Go.parse_input("/compact keep the API decisions") ==
+               {:command, "compact", "keep the API decisions"}
+
+      assert Go.parse_input("/home/me/app is broken") == {:message, "/home/me/app is broken"}
+    end
+
+    test "a command before the first message asks again instead of sending it" do
+      output =
+        capture_io("/compact\nexit\n", fn -> send(self(), {:result, Go.run("")}) end)
+
+      assert output =~ "/compact needs a conversation first"
+      assert_received {:result, :ok}
+    end
+
+    test "add_user_text starts a new turn, or joins the summary right after /compact" do
+      normal = [%{role: "user", content: "hi"}, %{role: "assistant", content: []}]
+      assert Go.add_user_text(normal, "next") == normal ++ [%{role: "user", content: "next"}]
+
+      compacted = [%{role: "user", content: "SUMMARY"}]
+      assert Go.add_user_text(compacted, "next") == [%{role: "user", content: "SUMMARY\n\nnext"}]
+    end
+  end
+
+  describe "compaction" do
+    test "the prompt asks for a tagged summary, no tools, and adds the focus" do
+      prompt = Go.compaction_prompt("")
+      assert prompt =~ "<summary></summary>"
+      assert prompt =~ "Do not call any tools"
+      refute prompt =~ "pay particular attention"
+
+      assert Go.compaction_prompt("the cache numbers") =~
+               "pay particular attention to: the cache numbers"
+    end
+
+    test "extract_summary takes the tagged text, falls back to the reply, rejects tool calls" do
+      reply = fn text ->
+        %{"stop_reason" => "end_turn", "content" => [%{"type" => "text", "text" => text}]}
+      end
+
+      assert Go.extract_summary(reply.("Here:\n<summary>\n did X \n</summary>")) == {:ok, "did X"}
+      assert Go.extract_summary(reply.("no tags")) == {:ok, "no tags"}
+      assert {:error, _} = Go.extract_summary(reply.("<summary> </summary>"))
+      assert {:error, _} = Go.extract_summary(%{"stop_reason" => "tool_use", "content" => []})
+    end
+
+    @tag :tmp_dir
+    test "the compacted conversation is AGENTS.md plus the marked summary", %{tmp_dir: dir} do
+      assert [%{role: "user", content: content}] = Go.compacted_messages("did X", dir)
+      assert content =~ "<earlier_conversation_summary>"
+      assert content =~ "did X\n</earlier_conversation_summary>"
+      refute content =~ "project_instructions"
+
+      File.write!(Path.join(dir, "AGENTS.md"), "Use tabs.")
+      assert [%{content: content}] = Go.compacted_messages("did X", dir)
+      assert content =~ "Use tabs."
+      assert content =~ "<earlier_conversation_summary>"
+    end
+
+    test "the status line suggests /compact only for a large prompt" do
+      small = %{"input_tokens" => 10, "output_tokens" => 1}
+      large = %{"input_tokens" => 5, "cache_read_input_tokens" => 160_000, "output_tokens" => 1}
+
+      refute Go.turn_status(1, "end_turn", small) =~ "/compact"
+      assert Go.turn_status(1, "end_turn", large) =~ "large context: /compact to shrink it"
     end
   end
 end

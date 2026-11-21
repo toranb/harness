@@ -163,6 +163,13 @@ defmodule Go do
   # dependencies are large and rarely what you're looking for.
   @grep_skip_dirs ~w(_build deps node_modules)
 
+  # Shown for an unknown slash command.
+  @commands_help "Commands: /compact [focus] summarizes the conversation to free up context; exit quits."
+
+  # The status line suggests /compact once a prompt is this big. It is only
+  # a hint: nothing compacts until you type the command.
+  @compact_hint_tokens 150_000
+
   @doc "The tool definitions sent to the API with every request."
   def tools, do: @tools
 
@@ -263,19 +270,27 @@ defmodule Go do
     3. otherwise its turn is over: read the user's next message
        (`read_user_input/0`), append it and go back to 1
 
-  The conversation (`messages`) only ever grows, and every request sends all
-  of it. A blank prompt asks for one at `>`. Type `exit` or press Ctrl-D to quit.
+  The conversation (`messages`) grows with every request, and every request
+  sends all of it. `/compact` at the `>` prompt replaces it with a summary
+  (`compact/3`). A blank prompt asks for one at `>`. Type `exit` or press
+  Ctrl-D to quit.
   """
   def run(prompt) when is_binary(prompt) do
     {:ok, _} = Application.ensure_all_started(:req)
+    start(parse_input(prompt))
+  end
 
-    case String.trim(prompt) do
-      "" ->
-        with {:ok, prompt} <- read_user_input(), do: run(prompt)
+  # Before the first message there is nothing to compact, so a command just
+  # asks again.
+  defp start({:message, text}),
+    do: loop([%{role: "user", content: first_message(text, File.cwd!())}], 1)
 
-      prompt ->
-        loop([%{role: "user", content: first_message(prompt, File.cwd!())}], 1)
-    end
+  defp start(:exit), do: :ok
+  defp start(:blank), do: start(read_user_input())
+
+  defp start({:command, name, _}) do
+    IO.puts("/#{name} needs a conversation first; send a message.")
+    start(read_user_input())
   end
 
   # One pass = one request to the model. `turn` counts requests, for display.
@@ -304,12 +319,158 @@ defmodule Go do
     end
   end
 
-  # The model finished its turn: wait for the user's next message.
+  # The model finished its turn: wait for the user's next message or command.
   defp next_prompt(messages, turn) do
     case read_user_input() do
-      {:ok, text} -> loop(messages ++ [%{role: "user", content: text}], turn)
-      :exit -> :ok
+      {:message, text} ->
+        loop(add_user_text(messages, text), turn)
+
+      {:command, "compact", focus} ->
+        case compact(messages, focus, turn) do
+          {:ok, compacted} ->
+            next_prompt(compacted, turn + 1)
+
+          {:error, reason} ->
+            IO.puts("[compact failed] #{reason}\nThe conversation is unchanged.")
+            next_prompt(messages, turn + 1)
+        end
+
+      {:command, name, _} ->
+        IO.puts("Unknown command /#{name}. #{@commands_help}")
+        next_prompt(messages, turn)
+
+      :exit ->
+        :ok
     end
+  end
+
+  @doc """
+  Adds the user's text to the conversation.
+
+  Normally that is a new user message. Right after `/compact` the
+  conversation is a single user message holding the summary; the API wants
+  user and assistant turns to alternate, so the text joins that message
+  instead of following it.
+  """
+  def add_user_text(messages, text) do
+    case List.last(messages) do
+      %{role: "user", content: summary} when is_binary(summary) ->
+        List.replace_at(messages, -1, %{role: "user", content: summary <> "\n\n" <> text})
+
+      _ ->
+        messages ++ [%{role: "user", content: text}]
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Compaction (/compact)
+  # ---------------------------------------------------------------------------
+
+  @doc """
+  Replaces the conversation with a summary of it, so a long session can keep
+  going without hitting the context limit. Runs only when you type
+  `/compact [focus]` at the `>` prompt, never automatically, and only between
+  turns, so no tool call is ever left without its result.
+
+  1. Send the whole conversation plus one more user message asking for a
+     summary (`compaction_prompt/1`). The prefix is already cached, so this
+     request is cheap.
+  2. Take the text inside `<summary>` tags (`extract_summary/1`).
+  3. Start a new conversation holding only AGENTS.md (if any) and the
+     summary (`compacted_messages/2`). Your next message is added to it.
+
+  Nothing from before the summary is replayed: no earlier turns, tool
+  results or thinking blocks. The summary is all the model keeps, which is
+  why the prompt says exactly what to preserve. The next request starts a
+  new cache entry for the conversation; tools + system stay cached.
+
+  Returns `{:ok, new_messages}`, or `{:error, reason}` with the conversation
+  left as it was.
+  """
+  def compact(messages, focus, turn) do
+    request = messages ++ [%{role: "user", content: compaction_prompt(focus)}]
+    IO.puts("[compact] summarizing #{length(messages)} messages...")
+
+    with {:ok, response} <- call_model(request),
+         IO.puts("[compact] " <> turn_status(turn, response["stop_reason"], response["usage"])),
+         {:ok, summary} <- extract_summary(response) do
+      IO.puts("\n--- summary (the model's only memory of the session from here on) ---")
+      IO.puts(summary)
+      IO.puts("--- end of summary ---")
+      IO.puts("[compact] the conversation is now this summary; your next message continues it")
+      {:ok, compacted_messages(summary, File.cwd!())}
+    end
+  end
+
+  @doc """
+  The request that asks the model to summarize the conversation.
+
+  This is the summarization prompt Anthropic suggests for client-side
+  compaction. It lists what a summary must keep so the work can continue
+  without being redone, and its last sentence stops the model from calling
+  a tool, since the request still carries the tool list. `focus` is
+  whatever you typed after `/compact`.
+  """
+  def compaction_prompt(focus) do
+    base =
+      "Summarize the transcript inside <summary></summary> tags. Include relevant information " <>
+        "in the summary such that this conversation will be continued by a new context window " <>
+        "without needing to redo work or be reprovided with relevant constraints or context. " <>
+        "Be sure to preserve: (1) any difficulties or problems that came up, and how they were " <>
+        "handled or resolved; (2) any possibilities, options, or approaches that were raised, " <>
+        "tried, or set aside, and why; (3) anything that was asked for, decided, agreed, ruled " <>
+        "out, or established as a preference, constraint, or boundary - stated exactly; " <>
+        "(4) exactly where things stand now - what has been covered, settled, or completed so " <>
+        "far; (5) anything still open, unresolved, promised, or expected to happen next; " <>
+        "(6) specific details that would be hard to reconstruct - names, numbers, dates, exact " <>
+        "wording, links or references - kept exactly. Be complete on these even at the cost of " <>
+        "length; keep everything else concise. Weight the two voices differently: keep what the " <>
+        "user said, asked for, shared, or established carefully and close to their own words; " <>
+        "your own explanations and reasoning can be condensed much further, to what they " <>
+        "concluded or produced - as long as nothing in the six items above is dropped. Do not " <>
+        "call any tools while writing this summary; respond with text only."
+
+    case String.trim(focus) do
+      "" -> base
+      focus -> base <> "\n\nThe user asked the summary to pay particular attention to: " <> focus
+    end
+  end
+
+  @doc """
+  Pulls the summary out of the model's reply: the text inside
+  `<summary>` tags, or the whole reply if the tags are missing.
+  """
+  def extract_summary(%{"stop_reason" => "tool_use"}),
+    do: {:error, "the model called a tool instead of writing a summary"}
+
+  def extract_summary(%{"content" => content}) do
+    text = for(%{"type" => "text", "text" => t} <- content, do: t) |> Enum.join("\n")
+
+    summary =
+      case Regex.run(~r{<summary>(.*)</summary>}s, text) do
+        [_, inside] -> String.trim(inside)
+        nil -> String.trim(text)
+      end
+
+    if summary == "", do: {:error, "the model returned an empty summary"}, else: {:ok, summary}
+  end
+
+  @doc """
+  The conversation after `/compact`: one user message with AGENTS.md (if
+  any, via `first_message/2`) and the summary, marked so the model knows
+  what it is. `add_user_text/2` appends your next message to it.
+  """
+  def compacted_messages(summary, cwd) do
+    block = """
+    <earlier_conversation_summary>
+    This session was compacted: the conversation so far was replaced by this
+    summary of it. Continue the work from here.
+
+    #{summary}
+    </earlier_conversation_summary>\
+    """
+
+    [%{role: "user", content: first_message(block, cwd)}]
   end
 
   @doc """
@@ -367,9 +528,14 @@ defmodule Go do
     written = usage["cache_creation_input_tokens"] || 0
     uncached = usage["input_tokens"] || 0
 
-    "[turn #{turn}] stop_reason=#{stop_reason} | prompt #{read + written + uncached} tokens " <>
+    prompt = read + written + uncached
+
+    hint =
+      if prompt >= @compact_hint_tokens, do: " | large context: /compact to shrink it", else: ""
+
+    "[turn #{turn}] stop_reason=#{stop_reason} | prompt #{prompt} tokens " <>
       "(cache read #{read}, cache write #{written}, uncached #{uncached}) | " <>
-      "output #{usage["output_tokens"] || 0} tokens"
+      "output #{usage["output_tokens"] || 0} tokens" <> hint
   end
 
   # Runs every tool call in the model's response, in order, and returns one
@@ -400,17 +566,46 @@ defmodule Go do
   end
 
   @doc """
-  Reads the user's next message at the `>` prompt, skipping blank lines.
-  Returns `{:ok, text}`, or `:exit` for `exit`, `quit` or Ctrl-D.
+  Reads the user's next input at the `>` prompt, skipping blank lines.
+  Returns what `parse_input/1` returns (never `:blank`); Ctrl-D is `:exit`.
   """
   def read_user_input do
     case read_line("\n> ") do
-      :eof -> :exit
-      "" -> read_user_input()
-      text when text in ["exit", "quit"] -> :exit
-      text -> {:ok, text}
+      :eof ->
+        :exit
+
+      line ->
+        case parse_input(line) do
+          :blank -> read_user_input()
+          input -> input
+        end
     end
   end
+
+  @doc """
+  Decides what a line typed at `>` is:
+
+    * `:blank` for an empty line
+    * `:exit` for `exit` or `quit`
+    * `{:command, name, rest}` for a slash command such as `/compact focus on X`
+    * `{:message, text}` for anything else, which goes to the model
+
+  Only a slash followed by letters is a command, so a message that starts
+  with a path such as `/home/me/app` still goes to the model.
+  """
+  def parse_input(line) do
+    text = String.trim(line)
+
+    cond do
+      text == "" -> :blank
+      text in ["exit", "quit"] -> :exit
+      match = Regex.run(~r{\A/([a-z]+)(?:\s+(.*))?\z}s, text) -> command(match)
+      true -> {:message, text}
+    end
+  end
+
+  defp command([_, name]), do: {:command, name, ""}
+  defp command([_, name, rest]), do: {:command, name, rest}
 
   defp read_line(label) do
     case IO.gets(label) do
